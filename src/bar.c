@@ -84,6 +84,7 @@ struct NintyBar {
     GPtrArray *menu_results;
     GPtrArray *hits;
     GHashTable *icon_cache;
+    GtkIconTheme *icon_theme;
 
     guint tick_source;
     guint slow_source;
@@ -117,7 +118,6 @@ struct NintyBar {
     char osd_text[160];
     int osd_value;
     gboolean osd_mute;
-    char last_layout[8];
 };
 
 static void close_menu(NintyBar *bar);
@@ -222,11 +222,16 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
         return paintable;
     }
 
-    GtkIconTheme *theme =
-        gtk_icon_theme_get_for_display(gdk_display_get_default());
     paintable = gtk_icon_theme_lookup_by_gicon(
-        theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
+        bar->icon_theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
         GTK_ICON_LOOKUP_FORCE_REGULAR);
+    if (paintable == NULL) {
+        GtkIconTheme *theme =
+            gtk_icon_theme_get_for_display(gdk_display_get_default());
+        paintable = gtk_icon_theme_lookup_by_gicon(
+            theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
+            GTK_ICON_LOOKUP_FORCE_REGULAR);
+    }
     if (paintable != NULL) {
         g_hash_table_insert(bar->icon_cache, g_strdup(cache_key), paintable);
     }
@@ -577,17 +582,8 @@ static GAppInfo *menu_result_at(NintyBar *bar, int index) {
 static void close_menu(NintyBar *bar);
 
 static void niri_changed_cb(NiriClient *client, gpointer user_data) {
+    (void)client;
     NintyBar *bar = user_data;
-    const char *layout = niri_client_keyboard_layout(client);
-    if (layout != NULL && layout[0] != '\0') {
-        if (bar->last_layout[0] != '\0' &&
-            g_strcmp0(bar->last_layout, layout) != 0) {
-            char text[64];
-            g_snprintf(text, sizeof(text), "Layout: %s", layout);
-            osd_show_text(bar, text);
-        }
-        g_strlcpy(bar->last_layout, layout, sizeof(bar->last_layout));
-    }
     gtk_widget_queue_draw(bar->area);
 }
 
@@ -2300,6 +2296,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->hits = g_ptr_array_new_with_free_func(g_free);
     bar->icon_cache = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
+    bar->icon_theme = gtk_icon_theme_new();
+    gtk_icon_theme_set_theme_name(bar->icon_theme, "hicolor");
     bar->menu_hover = -1;
     bar->panel_hover = -1;
 
@@ -2365,5 +2363,6 @@ void ninty_bar_free(NintyBar *bar) {
     g_free(bar->menu_query);
     g_ptr_array_unref(bar->hits);
     g_hash_table_destroy(bar->icon_cache);
+    g_object_unref(bar->icon_theme);
     g_free(bar);
 }

@@ -312,6 +312,13 @@ static void parse_event(NiriClient *client, JsonObject *object) {
             if (window_node != NULL && JSON_NODE_HOLDS_OBJECT(window_node)) {
                 NiriWindow *new_window =
                     parse_window(json_node_get_object(window_node));
+                if (new_window->is_focused) {
+                    for (guint i = 0; i < client->windows->len; i++) {
+                        NiriWindow *window =
+                            g_ptr_array_index(client->windows, i);
+                        window->is_focused = FALSE;
+                    }
+                }
                 NiriWindow *old_window =
                     find_window(client, new_window->id);
                 if (old_window != NULL) {
