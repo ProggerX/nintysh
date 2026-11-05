@@ -258,7 +258,7 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
     GtkIconTheme *global =
         gtk_icon_theme_get_for_display(gdk_display_get_default());
     GtkIconPaintable *global_icon = gtk_icon_theme_lookup_by_gicon(
-        global, icon, 20, 1, GTK_TEXT_DIR_NONE,
+        global, icon, 48, 2, GTK_TEXT_DIR_NONE,
         GTK_ICON_LOOKUP_FORCE_REGULAR);
 
     paintable = NULL;
@@ -267,7 +267,7 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
         global_icon = NULL;
     } else {
         paintable = gtk_icon_theme_lookup_by_gicon(
-            bar->icon_theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
+            bar->icon_theme, icon, 48, 2, GTK_TEXT_DIR_NONE,
             GTK_ICON_LOOKUP_FORCE_REGULAR);
         if (paintable == NULL) {
             paintable = global_icon;
