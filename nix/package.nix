@@ -20,7 +20,7 @@ stdenv.mkDerivation {
     src = lib.cleanSource ../.;
     filter = path: type:
       let name = baseNameOf path;
-      in !(builtins.elem name [ "build" ".direnv" ]);
+      in !(builtins.elem name [ "build" "docs" ".direnv" ]);
   };
 
   nativeBuildInputs = [
