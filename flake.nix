@@ -1,71 +1,31 @@
 {
   description = "nintysh - a Windows 98 flavoured Wayland shell for niri";
 
-  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+    flake-parts.url = "github:hercules-ci/flake-parts";
+    home-manager = {
+      url = "github:nix-community/home-manager";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+  };
 
-  outputs = { self, nixpkgs }:
-    let
+  outputs = inputs@{ flake-parts, ... }:
+    flake-parts.lib.mkFlake { inherit inputs; } {
+      imports = [
+        inputs.flake-parts.flakeModules.modules
+      ];
+
       systems = [ "x86_64-linux" "aarch64-linux" ];
-      forAllSystems = nixpkgs.lib.genAttrs systems;
-    in {
-      packages = forAllSystems (system:
+
+      perSystem = { pkgs, ... }:
         let
-          pkgs = import nixpkgs { inherit system; };
-          nintysh = pkgs.stdenv.mkDerivation {
-            pname = "nintysh";
-            version = "0.1.0";
-
-            src = pkgs.lib.cleanSourceWith {
-              src = pkgs.lib.cleanSource ./.;
-              filter = path: type:
-                let name = baseNameOf path;
-                in !(builtins.elem name [ "build" ".direnv" ]);
-            };
-
-            nativeBuildInputs = with pkgs; [
-              just
-              pkg-config
-              wrapGAppsHook4
-            ];
-
-            buildInputs = with pkgs; [
-              gtk4
-              gtk4-layer-shell
-              json-glib
-            ];
-
-            gappsWrapperArgs = [
-              "--prefix" "PATH" ":" (pkgs.lib.makeBinPath [ pkgs.wl-clipboard ])
-            ];
-
-            buildPhase = ''
-              runHook preBuild
-              just build
-              runHook postBuild
-            '';
-
-            installPhase = ''
-              runHook preInstall
-              just _install "$out"
-              runHook postInstall
-            '';
-
-            meta = {
-              description = "A Windows 98 style Wayland shell for niri";
-              platforms = pkgs.lib.platforms.linux;
-              mainProgram = "nintysh";
-            };
-          };
+          nintysh = pkgs.callPackage ./nix/package.nix { };
         in {
-          default = nintysh;
-          nintysh = nintysh;
-        });
+          packages.default = nintysh;
+          packages.nintysh = nintysh;
 
-      devShells = forAllSystems (system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in {
-          default = pkgs.mkShell {
+          devShells.default = pkgs.mkShell {
             packages = with pkgs; [
               just
               pkg-config
@@ -74,11 +34,23 @@
               json-glib
               gdb
               niri
+              wl-clipboard
             ];
           };
-        });
 
-      formatter = forAllSystems (system:
-        nixpkgs.legacyPackages.${system}.nixfmt-rfc-style);
+          formatter = pkgs.nixfmt-rfc-style;
+        };
+
+      flake = {
+        lib.mkNintysh = pkgs: { extraConfig ? "", wrapperArgs ? [ ] }:
+          pkgs.callPackage ./nix/package.nix {
+            inherit extraConfig wrapperArgs;
+          };
+
+        modules.homeManager = {
+          default = ./nix/hm.nix;
+          nintysh = ./nix/hm.nix;
+        };
+      };
     };
 }

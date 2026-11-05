@@ -1,21 +1,24 @@
 #include "win98.h"
 
+#include "config.h"
+
 #include <math.h>
 #include <pango/pangocairo.h>
 
 #define RGB(r, g, b) { (r) / 255.0, (g) / 255.0, (b) / 255.0 }
 
-const Win98Color win98_face = RGB(192, 192, 192);
-const Win98Color win98_highlight = RGB(255, 255, 255);
-const Win98Color win98_light = RGB(223, 223, 223);
-const Win98Color win98_shadow = RGB(128, 128, 128);
-const Win98Color win98_dark = RGB(0, 0, 0);
-const Win98Color win98_text = RGB(0, 0, 0);
-const Win98Color win98_text_disabled = RGB(128, 128, 128);
-const Win98Color win98_navy = RGB(0, 0, 128);
-const Win98Color win98_white = RGB(255, 255, 255);
-const Win98Color win98_black = RGB(0, 0, 0);
-const Win98Color win98_teal = RGB(0, 128, 128);
+const Win98Color win98_face = NINTYSH_RGB(NINTYSH_COLOR_FACE);
+const Win98Color win98_highlight = NINTYSH_RGB(NINTYSH_COLOR_HIGHLIGHT);
+const Win98Color win98_light = NINTYSH_RGB(NINTYSH_COLOR_LIGHT);
+const Win98Color win98_shadow = NINTYSH_RGB(NINTYSH_COLOR_SHADOW);
+const Win98Color win98_dark = NINTYSH_RGB(NINTYSH_COLOR_DARK);
+const Win98Color win98_text = NINTYSH_RGB(NINTYSH_COLOR_TEXT);
+const Win98Color win98_text_disabled =
+    NINTYSH_RGB(NINTYSH_COLOR_TEXT_DISABLED);
+const Win98Color win98_navy = NINTYSH_RGB(NINTYSH_COLOR_NAVY);
+const Win98Color win98_white = NINTYSH_RGB(NINTYSH_COLOR_WHITE);
+const Win98Color win98_black = NINTYSH_RGB(NINTYSH_COLOR_BLACK);
+const Win98Color win98_teal = NINTYSH_RGB(NINTYSH_COLOR_TEAL);
 
 static const Win98Color win98_yellow = RGB(255, 255, 0);
 static const Win98Color win98_green = RGB(0, 128, 0);
@@ -59,8 +62,9 @@ static PangoLayout *create_layout(cairo_t *cr, const char *text,
     PangoLayout *layout = pango_cairo_create_layout(cr);
     PangoFontDescription *desc = pango_font_description_new();
 
-    pango_font_description_set_family(desc, "Tahoma");
-    pango_font_description_set_absolute_size(desc, 11 * PANGO_SCALE);
+    pango_font_description_set_family(desc, NINTYSH_FONT_FAMILY);
+    pango_font_description_set_absolute_size(desc,
+                                              NINTYSH_FONT_PX * PANGO_SCALE);
     pango_font_description_set_weight(
         desc, bold ? PANGO_WEIGHT_BOLD : PANGO_WEIGHT_NORMAL);
     pango_layout_set_font_description(layout, desc);

@@ -1,5 +1,6 @@
 #include "bar.h"
 
+#include "config.h"
 #include "control.h"
 #include "niri.h"
 #include "win98.h"
@@ -9,12 +10,12 @@
 #include <math.h>
 #include <string.h>
 
-#define BAR_HEIGHT 28
-#define BUTTON_Y 3.0
-#define BUTTON_HEIGHT 22.0
-#define MENU_ROW_HEIGHT 22.0
-#define MENU_WIDTH 252.0
-#define MENU_SIDEBAR 22.0
+#define BAR_HEIGHT NINTYSH_BAR_HEIGHT
+#define BUTTON_Y NINTYSH_BUTTON_Y
+#define BUTTON_HEIGHT NINTYSH_BUTTON_HEIGHT
+#define MENU_ROW_HEIGHT NINTYSH_MENU_ROW_HEIGHT
+#define MENU_WIDTH NINTYSH_MENU_WIDTH
+#define MENU_SIDEBAR NINTYSH_MENU_SIDEBAR
 
 typedef enum {
     HIT_NONE,
@@ -312,7 +313,7 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
     GtkIconTheme *global =
         gtk_icon_theme_get_for_display(gdk_display_get_default());
     GtkIconPaintable *global_icon = gtk_icon_theme_lookup_by_gicon(
-        global, icon, 48, 2, GTK_TEXT_DIR_NONE,
+        global, icon, NINTYSH_ICON_LOOKUP_SIZE, NINTYSH_ICON_LOOKUP_SCALE, GTK_TEXT_DIR_NONE,
         GTK_ICON_LOOKUP_FORCE_REGULAR);
 
     paintable = NULL;
@@ -321,7 +322,7 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
         global_icon = NULL;
     } else {
         paintable = gtk_icon_theme_lookup_by_gicon(
-            bar->icon_theme, icon, 48, 2, GTK_TEXT_DIR_NONE,
+            bar->icon_theme, icon, NINTYSH_ICON_LOOKUP_SIZE, NINTYSH_ICON_LOOKUP_SCALE, GTK_TEXT_DIR_NONE,
             GTK_ICON_LOOKUP_FORCE_REGULAR);
         if (paintable == NULL) {
             paintable = global_icon;
@@ -607,7 +608,7 @@ static gboolean update_network(NintyBar *bar) {
 }
 
 static void clipboard_trim(NintyBar *bar) {
-    while (bar->clipboard_history->len > 30) {
+    while (bar->clipboard_history->len > NINTYSH_CLIPBOARD_MAX_ENTRIES) {
         g_ptr_array_remove_index(
             bar->clipboard_history, bar->clipboard_history->len - 1);
     }
@@ -627,7 +628,7 @@ static void clipboard_add(NintyBar *bar, const char *text) {
     }
 
     g_ptr_array_insert(bar->clipboard_history, 0,
-                       g_strndup(text, 64 * 1024));
+                       g_strndup(text, NINTYSH_CLIPBOARD_MAX_BYTES));
     clipboard_trim(bar);
 }
 
@@ -831,7 +832,7 @@ static MenuLayout menu_layout(NintyBar *bar, double screen_w,
         max_height = 48.0;
     }
 
-    const double search_h = 22.0;
+    const double search_h = NINTYSH_MENU_SEARCH_HEIGHT;
     double wanted = 8.0 + search_h + 4.0 +
                     (count > 0 ? count : 1) * MENU_ROW_HEIGHT;
     layout.w = MENU_WIDTH;
@@ -841,7 +842,7 @@ static MenuLayout menu_layout(NintyBar *bar, double screen_w,
     if (layout.w < 120.0) {
         layout.w = 120.0;
     }
-    layout.h = MIN(wanted, MIN(420.0, max_height));
+    layout.h = MIN(wanted, MIN(NINTYSH_MENU_MAX_HEIGHT, max_height));
     layout.x = 2.0;
     layout.y = screen_h - BAR_HEIGHT - layout.h - 1.0;
     if (layout.y < 2.0) {
@@ -917,8 +918,14 @@ static void menu_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     cairo_pattern_t *gradient = cairo_pattern_create_linear(
         layout.x + 3, layout.y + 3, layout.x + 3,
         layout.y + layout.h - 3);
-    cairo_pattern_add_color_stop_rgb(gradient, 0.0, 0.0, 0.0, 0.5);
-    cairo_pattern_add_color_stop_rgb(gradient, 1.0, 0.063, 0.518, 0.816);
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 0.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_TOP));
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 1.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_BOTTOM));
     cairo_set_source(cr, gradient);
     cairo_rectangle(cr, layout.x + 2, layout.y + 2, layout.sidebar,
                     layout.h - 4);
@@ -992,7 +999,7 @@ static void menu_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
         const char *name = g_app_info_get_display_name(app);
         GtkIconPaintable *icon = app_icon(bar, app);
         if (icon != NULL) {
-            draw_paintable(cr, icon, layout.content_x + 2, y + 1, 20);
+            draw_paintable(cr, icon, layout.content_x + 2, y + 1, NINTYSH_ICON_SIZE);
         } else {
             win98_draw_app_icon(cr, layout.content_x + 2, y + 1);
         }
@@ -1306,8 +1313,14 @@ static void draw_panel_frame(cairo_t *cr, const PanelFrame *frame,
 
     cairo_pattern_t *gradient =
         cairo_pattern_create_linear(tx, ty, tx, ty + th);
-    cairo_pattern_add_color_stop_rgb(gradient, 0.0, 0.0, 0.0, 0.5);
-    cairo_pattern_add_color_stop_rgb(gradient, 1.0, 0.063, 0.518, 0.816);
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 0.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_TOP));
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 1.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_BOTTOM));
     cairo_set_source(cr, gradient);
     cairo_rectangle(cr, tx, ty, tw, th);
     cairo_fill(cr);
@@ -1999,7 +2012,7 @@ static void osd_present(NintyBar *bar) {
     gtk_widget_set_visible(bar->osd_window, TRUE);
     gtk_window_present(GTK_WINDOW(bar->osd_window));
     gtk_widget_queue_draw(bar->osd_area);
-    bar->osd_source = g_timeout_add(1400, osd_hide_cb, bar);
+    bar->osd_source = g_timeout_add(NINTYSH_OSD_TIMEOUT_MS, osd_hide_cb, bar);
 }
 
 static void osd_show_volume(NintyBar *bar) {
@@ -2221,7 +2234,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
             GtkIconPaintable *icon = window_icon(bar, window);
             if (icon != NULL) {
                 draw_paintable(cr, icon, current_x + 3.0 + offset,
-                               y + 1.0 + offset, 20);
+                               y + 1.0 + offset, NINTYSH_ICON_SIZE);
             } else {
                 win98_draw_app_icon(cr, current_x + 3.0 + offset,
                                     y + 3.0 + offset);
@@ -2607,7 +2620,8 @@ static GtkWidget *create_osd_window(NintyBar *bar) {
 
     GdkRectangle geometry = { 0 };
     primary_monitor_geometry(&geometry);
-    gtk_window_set_default_size(GTK_WINDOW(window), 220, 58);
+    gtk_window_set_default_size(GTK_WINDOW(window), NINTYSH_OSD_WIDTH,
+                                NINTYSH_OSD_HEIGHT);
 
     gtk_layer_init_for_window(GTK_WINDOW(window));
     gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-osd");
@@ -2617,9 +2631,9 @@ static GtkWidget *create_osd_window(NintyBar *bar) {
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
                          TRUE);
     gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         BAR_HEIGHT + 24);
+                         NINTYSH_OSD_MARGIN_BOTTOM);
     gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
-                         MAX(2, (geometry.width - 220) / 2));
+                         MAX(2, (geometry.width - NINTYSH_OSD_WIDTH) / 2));
     gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
     gtk_layer_set_keyboard_mode(GTK_WINDOW(window),
                                 GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
@@ -2746,9 +2760,9 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->network_handler = g_signal_connect(
         monitor, "network-changed", G_CALLBACK(network_changed_cb), bar);
 
-    bar->tick_source = g_timeout_add_seconds(1, bar_tick, bar);
-    bar->slow_source = g_timeout_add_seconds(5, bar_slow_tick, bar);
-    bar->clipboard_source = g_timeout_add_seconds(2, clipboard_tick, bar);
+    bar->tick_source = g_timeout_add_seconds(NINTYSH_CLOCK_TICK_SECONDS, bar_tick, bar);
+    bar->slow_source = g_timeout_add_seconds(NINTYSH_SYSTEM_POLL_SECONDS, bar_slow_tick, bar);
+    bar->clipboard_source = g_timeout_add_seconds(NINTYSH_CLIPBOARD_POLL_SECONDS, clipboard_tick, bar);
     clipboard_tick(bar);
     bar->control = ninty_control_new(control_command_cb, bar);
 
