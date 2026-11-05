@@ -49,5 +49,6 @@ void win98_draw_network_icon(cairo_t *cr, double x, double y,
                              gboolean connected);
 void win98_draw_battery_icon(cairo_t *cr, double x, double y, int percent,
                              gboolean charging);
+void win98_draw_clipboard_icon(cairo_t *cr, double x, double y);
 
 #endif

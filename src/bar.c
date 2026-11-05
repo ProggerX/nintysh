@@ -26,6 +26,7 @@ typedef enum {
     HIT_LAYOUT,
     HIT_NETWORK,
     HIT_BATTERY,
+    HIT_CLIPBOARD,
 } HitKind;
 
 typedef struct {
@@ -58,6 +59,7 @@ typedef enum {
     PANEL_NETWORK,
     PANEL_POWER,
     PANEL_TASKMENU,
+    PANEL_CLIPBOARD,
 } PanelKind;
 
 typedef struct {
@@ -67,6 +69,15 @@ typedef struct {
     double h;
     double title_h;
 } PanelFrame;
+
+typedef struct {
+    NintyBar *bar;
+    GdkMonitor *monitor;
+    GtkWidget *window;
+    GtkWidget *area;
+    GPtrArray *hits;
+    char *output;
+} BarSurface;
 
 struct NintyBar {
     GtkApplication *app;
@@ -82,13 +93,18 @@ struct NintyBar {
     NiriClient *niri;
     GPtrArray *apps;
     GPtrArray *menu_results;
-    GPtrArray *hits;
+    GPtrArray *surfaces;
+    GPtrArray *active_hits;
+    const char *active_output;
     GHashTable *icon_cache;
     GHashTable *app_index;
     GtkIconTheme *icon_theme;
+    GPtrArray *clipboard_history;
+    char *last_clipboard;
 
     guint tick_source;
     guint slow_source;
+    guint clipboard_source;
     gulong network_handler;
 
     gboolean volume_available;
@@ -111,6 +127,7 @@ struct NintyBar {
     gboolean volume_dragging;
     double volume_drag_x0;
     int panel_hover;
+    int clipboard_scroll;
     gint64 context_window_id;
     double context_x;
 
@@ -128,8 +145,12 @@ static void osd_show_volume(NintyBar *bar);
 static void osd_show_text(NintyBar *bar, const char *text);
 
 static void bar_clear_hits(NintyBar *bar) {
-    while (bar->hits->len > 0) {
-        g_ptr_array_remove_index(bar->hits, bar->hits->len - 1);
+    if (bar->active_hits == NULL) {
+        return;
+    }
+    while (bar->active_hits->len > 0) {
+        g_ptr_array_remove_index(bar->active_hits,
+                                 bar->active_hits->len - 1);
     }
 }
 
@@ -142,18 +163,51 @@ static void bar_add_hit(NintyBar *bar, HitKind kind, double x, double y,
     hit->w = w;
     hit->h = h;
     hit->value = value;
-    g_ptr_array_add(bar->hits, hit);
+    if (bar->active_hits != NULL) {
+        g_ptr_array_add(bar->active_hits, hit);
+    } else {
+        g_free(hit);
+    }
 }
 
-static BarHit *bar_hit_at(NintyBar *bar, double x, double y) {
-    for (guint i = bar->hits->len; i > 0; i--) {
-        BarHit *hit = g_ptr_array_index(bar->hits, i - 1);
+static BarHit *bar_hit_at(GPtrArray *hits, double x, double y) {
+    for (guint i = hits->len; i > 0; i--) {
+        BarHit *hit = g_ptr_array_index(hits, i - 1);
         if (x >= hit->x && x < hit->x + hit->w && y >= hit->y &&
             y < hit->y + hit->h) {
             return hit;
         }
     }
     return NULL;
+}
+
+static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
+                     gpointer user_data);
+static void bar_queue_redraw(NintyBar *bar);
+
+static void bar_surface_free(BarSurface *surface) {
+    g_free(surface->output);
+    g_ptr_array_unref(surface->hits);
+    g_free(surface);
+}
+
+static void bar_surface_draw(GtkDrawingArea *area, cairo_t *cr, int width,
+                             int height, gpointer user_data) {
+    BarSurface *surface = user_data;
+    NintyBar *bar = surface->bar;
+    bar->active_hits = surface->hits;
+    bar->active_output = surface->output;
+    bar_draw(area, cr, width, height, bar);
+}
+
+static void bar_queue_redraw(NintyBar *bar) {
+    if (bar->surfaces == NULL) {
+        return;
+    }
+    for (guint i = 0; i < bar->surfaces->len; i++) {
+        BarSurface *surface = g_ptr_array_index(bar->surfaces, i);
+        gtk_widget_queue_draw(surface->area);
+    }
 }
 
 static const char *current_output(NiriClient *niri) {
@@ -430,7 +484,7 @@ static gboolean toggle_volume(NintyBar *bar) {
         "wpctl set-mute @DEFAULT_AUDIO_SINK@ toggle", &output);
     g_free(output);
     update_volume(bar);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
     if (bar->panel_area != NULL) {
         gtk_widget_queue_draw(bar->panel_area);
     }
@@ -452,7 +506,7 @@ static void apply_volume(NintyBar *bar, int percent, gboolean commit) {
         run_command_sync(command, &output);
         g_free(output);
         update_volume(bar);
-        gtk_widget_queue_draw(bar->area);
+        bar_queue_redraw(bar);
     }
     if (bar->panel_area != NULL) {
         gtk_widget_queue_draw(bar->panel_area);
@@ -552,6 +606,70 @@ static gboolean update_network(NintyBar *bar) {
     return old_available != bar->network_available;
 }
 
+static void clipboard_trim(NintyBar *bar) {
+    while (bar->clipboard_history->len > 30) {
+        g_ptr_array_remove_index(
+            bar->clipboard_history, bar->clipboard_history->len - 1);
+    }
+}
+
+static void clipboard_add(NintyBar *bar, const char *text) {
+    if (text == NULL || text[0] == '\0') {
+        return;
+    }
+
+    for (guint i = 0; i < bar->clipboard_history->len; i++) {
+        const char *entry = g_ptr_array_index(bar->clipboard_history, i);
+        if (g_strcmp0(entry, text) == 0) {
+            g_ptr_array_remove_index(bar->clipboard_history, i);
+            break;
+        }
+    }
+
+    g_ptr_array_insert(bar->clipboard_history, 0,
+                       g_strndup(text, 64 * 1024));
+    clipboard_trim(bar);
+}
+
+static void clipboard_copy(NintyBar *bar, const char *text) {
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_new(
+        G_SUBPROCESS_FLAGS_STDIN_PIPE, &error, "wl-copy", NULL);
+    if (process == NULL) {
+        g_clear_error(&error);
+        return;
+    }
+
+    GBytes *bytes = g_bytes_new(text, strlen(text));
+    g_subprocess_communicate(process, bytes, NULL, NULL, NULL, &error);
+    g_bytes_unref(bytes);
+    g_clear_error(&error);
+    g_object_unref(process);
+
+    g_free(bar->last_clipboard);
+    bar->last_clipboard = g_strdup(text);
+    osd_show_text(bar, "Copied to clipboard");
+    gtk_widget_queue_draw(bar->panel_area);
+}
+
+static gboolean clipboard_tick(gpointer user_data) {
+    NintyBar *bar = user_data;
+    char *output = NULL;
+    if (!run_command_sync("wl-paste --no-newline --type text", &output)) {
+        return G_SOURCE_CONTINUE;
+    }
+
+    if (output != NULL && output[0] != '\0' &&
+        g_strcmp0(output, bar->last_clipboard) != 0) {
+        g_free(bar->last_clipboard);
+        bar->last_clipboard = g_strdup(output);
+        clipboard_add(bar, output);
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    g_free(output);
+    return G_SOURCE_CONTINUE;
+}
+
 static gint app_compare(gconstpointer a, gconstpointer b) {
     GAppInfo *app_a = *(GAppInfo *const *)a;
     GAppInfo *app_b = *(GAppInfo *const *)b;
@@ -593,8 +711,38 @@ static void launch_app(NintyBar *bar, GAppInfo *app) {
     g_object_unref(context);
 }
 
+static gboolean menu_command_mode(NintyBar *bar) {
+    return bar->menu_query != NULL && bar->menu_query[0] == '/';
+}
+
+static const char *menu_command_text(NintyBar *bar) {
+    if (!menu_command_mode(bar)) {
+        return "";
+    }
+    return bar->menu_query + 1;
+}
+
+static void run_shell_command(const char *command) {
+    if (command == NULL || command[0] == '\0') {
+        return;
+    }
+    const char *argv[] = { "/bin/sh", "-c", command, NULL };
+    GError *error = NULL;
+    if (!g_spawn_async(NULL, (char **)argv, NULL, G_SPAWN_SEARCH_PATH,
+                       NULL, NULL, NULL, &error)) {
+        g_warning("nintysh: cannot run command: %s", error->message);
+        g_error_free(error);
+    }
+}
+
 static void menu_update_results(NintyBar *bar) {
     g_ptr_array_set_size(bar->menu_results, 0);
+    if (menu_command_mode(bar)) {
+        bar->menu_scroll = 0;
+        bar->menu_selected = 0;
+        bar->menu_hover = -1;
+        return;
+    }
     gboolean has_query = bar->menu_query != NULL && bar->menu_query[0] != '\0';
     char *query = has_query ? g_utf8_casefold(bar->menu_query, -1) : NULL;
 
@@ -671,13 +819,13 @@ static void close_menu(NintyBar *bar);
 static void niri_changed_cb(NiriClient *client, gpointer user_data) {
     (void)client;
     NintyBar *bar = user_data;
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static MenuLayout menu_layout(NintyBar *bar, double screen_w,
                               double screen_h) {
     MenuLayout layout = { 0 };
-    int count = (int)bar->menu_results->len;
+    int count = menu_command_mode(bar) ? 1 : (int)bar->menu_results->len;
     double max_height = screen_h - BAR_HEIGHT - 8.0;
     if (max_height < 48.0) {
         max_height = 48.0;
@@ -731,6 +879,9 @@ static int menu_item_at(NintyBar *bar, const MenuLayout *layout, double x,
         y < layout->items_y ||
         y >= layout->items_y + layout->rows * MENU_ROW_HEIGHT) {
         return -1;
+    }
+    if (menu_command_mode(bar)) {
+        return 0;
     }
 
     int row = (int)((y - layout->items_y) / MENU_ROW_HEIGHT);
@@ -805,14 +956,25 @@ static void menu_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
         MIN(search_x + 4.0 + query_width, search_x + search_w - 5.0);
     win98_fill(cr, caret_x, search_y + 4.0, 1.0, 14.0, win98_text);
 
-    if (bar->menu_results->len == 0) {
+    if (menu_command_mode(bar)) {
+        const char *command = menu_command_text(bar);
+        win98_fill(cr, layout.content_x, layout.items_y, layout.content_w,
+                   MENU_ROW_HEIGHT, win98_navy);
+        win98_draw_app_icon(cr, layout.content_x + 2, layout.items_y + 1);
+        char text[512];
+        g_snprintf(text, sizeof(text), "Run: %s",
+                   command[0] != '\0' ? command : "type a command...");
+        win98_draw_text(cr, layout.content_x + 26, layout.items_y,
+                        layout.content_w - 28, MENU_ROW_HEIGHT, text,
+                        WIN98_ALIGN_LEFT, FALSE, win98_white, TRUE);
+    } else if (bar->menu_results->len == 0) {
         win98_draw_text(cr, layout.content_x, layout.items_y,
                         layout.content_w, MENU_ROW_HEIGHT,
                         "No matching applications", WIN98_ALIGN_CENTER,
                         FALSE, win98_text_disabled, TRUE);
     }
 
-    for (int row = 0; row < layout.rows; row++) {
+    for (int row = 0; !menu_command_mode(bar) && row < layout.rows; row++) {
         guint index = (guint)(bar->menu_scroll + row);
         if (index >= bar->menu_results->len) {
             break;
@@ -893,7 +1055,7 @@ static void open_menu(NintyBar *bar) {
     gtk_window_present(GTK_WINDOW(bar->menu_window));
     gtk_widget_grab_focus(bar->menu_area);
     gtk_widget_queue_draw(bar->menu_area);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static void close_menu(NintyBar *bar) {
@@ -903,7 +1065,7 @@ static void close_menu(NintyBar *bar) {
     bar->menu_open = FALSE;
     bar->menu_hover = -1;
     gtk_widget_set_visible(bar->menu_window, FALSE);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static void menu_clicked(GtkGestureClick *gesture, int n_press, double x,
@@ -920,7 +1082,11 @@ static void menu_clicked(GtkGestureClick *gesture, int n_press, double x,
         int index = menu_item_at(bar, &layout, x, y);
         if (index >= 0) {
             bar->menu_selected = index;
-            launch_app(bar, menu_result_at(bar, index));
+            if (menu_command_mode(bar)) {
+                run_shell_command(menu_command_text(bar));
+            } else {
+                launch_app(bar, menu_result_at(bar, index));
+            }
             close_menu(bar);
         }
         return;
@@ -999,6 +1165,13 @@ static gboolean menu_key_pressed(GtkEventControllerKey *controller,
     }
 
     if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        if (menu_command_mode(bar)) {
+            if (menu_command_text(bar)[0] != '\0') {
+                run_shell_command(menu_command_text(bar));
+                close_menu(bar);
+            }
+            return TRUE;
+        }
         GAppInfo *app =
             menu_result_at(bar, bar->menu_selected >= 0 ? bar->menu_selected
                                                         : 0);
@@ -1073,6 +1246,10 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
     case PANEL_TASKMENU:
         frame.w = 176.0;
         frame.h = 84.0;
+        break;
+    case PANEL_CLIPBOARD:
+        frame.w = 320.0;
+        frame.h = 260.0;
         break;
     default:
         frame.w = 1.0;
@@ -1362,6 +1539,71 @@ static void panel_draw_power(cairo_t *cr, NintyBar *bar,
                     WIN98_ALIGN_LEFT, FALSE, win98_text, FALSE);
 }
 
+static int clipboard_rows(const PanelFrame *frame) {
+    return (int)((frame->h - frame->title_h - 16.0) / 20.0);
+}
+
+static int clipboard_row_at(const PanelFrame *frame, double y) {
+    double list_y = frame->y + frame->title_h + 8.0;
+    if (y < list_y) {
+        return -1;
+    }
+    int row = (int)((y - list_y) / 20.0);
+    return row < clipboard_rows(frame) ? row : -1;
+}
+
+static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
+                                 const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Clipboard");
+
+    double list_x = frame->x + 8.0;
+    double list_y = frame->y + frame->title_h + 8.0;
+    double list_w = frame->w - 24.0;
+    int rows = clipboard_rows(frame);
+    int count = (int)bar->clipboard_history->len;
+    int max_scroll = MAX(0, count - rows);
+    bar->clipboard_scroll = CLAMP(bar->clipboard_scroll, 0, max_scroll);
+
+    if (count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w, 20.0,
+                        "Clipboard history is empty", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+    }
+
+    for (int row = 0; row < rows; row++) {
+        int index = bar->clipboard_scroll + row;
+        if (index >= count) {
+            break;
+        }
+        double y = list_y + row * 20.0;
+        gboolean selected = index == bar->panel_hover;
+        if (selected) {
+            win98_fill(cr, list_x, y, list_w, 20.0, win98_navy);
+        }
+        const char *text = g_ptr_array_index(bar->clipboard_history, index);
+        win98_draw_text(cr, list_x + 4.0, y, list_w - 8.0, 20.0, text,
+                        WIN98_ALIGN_LEFT, FALSE,
+                        selected ? win98_white : win98_text, TRUE);
+    }
+
+    if (max_scroll > 0) {
+        double sx = frame->x + frame->w - 14.0;
+        double sy = list_y;
+        double sh = frame->h - frame->title_h - 16.0;
+        win98_fill(cr, sx, sy, 12.0, sh, win98_light);
+        win98_bevel(cr, sx, sy, 12.0, sh, WIN98_BEVEL_SUNKEN);
+        double track_y = sy + 12.0;
+        double track_h = sh - 24.0;
+        double thumb_h = MAX(16.0, track_h * rows / count);
+        thumb_h = MIN(thumb_h, track_h);
+        double fraction = (double)bar->clipboard_scroll / max_scroll;
+        double thumb_y = track_y + (track_h - thumb_h) * fraction;
+        win98_fill(cr, sx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
+        win98_bevel(cr, sx + 1.0, thumb_y, 10.0, thumb_h,
+                    WIN98_BEVEL_RAISED);
+    }
+}
+
 static const char *task_menu_items[] = {
     "Focus", "Toggle Floating", "Fullscreen", NULL, "Close"
 };
@@ -1445,6 +1687,9 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     case PANEL_TASKMENU:
         panel_draw_task_menu(cr, bar, &frame);
         break;
+    case PANEL_CLIPBOARD:
+        panel_draw_clipboard(cr, bar, &frame);
+        break;
     default:
         break;
     }
@@ -1470,6 +1715,10 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     }
 
     close_menu(bar);
+    if (kind == PANEL_CLIPBOARD) {
+        bar->clipboard_scroll = 0;
+        bar->panel_hover = -1;
+    }
     if (kind == PANEL_CALENDAR) {
         GDateTime *now = g_date_time_new_now_local();
         bar->calendar_year = g_date_time_get_year(now);
@@ -1484,7 +1733,7 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     gtk_window_present(GTK_WINDOW(bar->panel_window));
     gtk_widget_grab_focus(bar->panel_area);
     gtk_widget_queue_draw(bar->panel_area);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static void open_task_menu(NintyBar *bar, gint64 window_id, double x) {
@@ -1500,7 +1749,7 @@ static void open_task_menu(NintyBar *bar, gint64 window_id, double x) {
     gtk_window_present(GTK_WINDOW(bar->panel_window));
     gtk_widget_grab_focus(bar->panel_area);
     gtk_widget_queue_draw(bar->panel_area);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static void close_panel(NintyBar *bar) {
@@ -1511,7 +1760,7 @@ static void close_panel(NintyBar *bar) {
     bar->volume_dragging = FALSE;
     bar->panel_hover = -1;
     gtk_widget_set_visible(bar->panel_window, FALSE);
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
 }
 
 static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
@@ -1542,6 +1791,21 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         }
         if (row >= 0) {
             close_panel(bar);
+        }
+        return;
+    }
+
+    if (bar->panel_kind == PANEL_CLIPBOARD) {
+        int row = clipboard_row_at(&frame, y);
+        double list_x = frame.x + 8.0;
+        double list_w = frame.w - 24.0;
+        if (row >= 0 && x >= list_x && x < list_x + list_w) {
+            int index = bar->clipboard_scroll + row;
+            if (index < (int)bar->clipboard_history->len) {
+                clipboard_copy(bar,
+                               g_ptr_array_index(bar->clipboard_history,
+                                                 index));
+            }
         }
         return;
     }
@@ -1665,14 +1929,18 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
     (void)controller;
     (void)x;
     NintyBar *bar = user_data;
-    if (bar->panel_kind != PANEL_TASKMENU) {
+    if (bar->panel_kind != PANEL_TASKMENU &&
+        bar->panel_kind != PANEL_CLIPBOARD) {
         return;
     }
 
     double width = gtk_widget_get_width(bar->panel_area);
     double height = gtk_widget_get_height(bar->panel_area);
-    PanelFrame frame = panel_frame_for(bar, PANEL_TASKMENU, width, height);
-    int hover = task_menu_row_at(&frame, y);
+    PanelFrame frame =
+        panel_frame_for(bar, bar->panel_kind, width, height);
+    int hover = bar->panel_kind == PANEL_TASKMENU
+                    ? task_menu_row_at(&frame, y)
+                    : clipboard_row_at(&frame, y);
     if (hover != bar->panel_hover) {
         bar->panel_hover = hover;
         gtk_widget_queue_draw(bar->panel_area);
@@ -1687,6 +1955,16 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
     if (bar->panel_kind == PANEL_VOLUME) {
         int delta = dy > 0 ? -2 : 2;
         apply_volume(bar, bar->volume_percent + delta, TRUE);
+    } else if (bar->panel_kind == PANEL_CLIPBOARD) {
+        double width = gtk_widget_get_width(bar->panel_area);
+        double height = gtk_widget_get_height(bar->panel_area);
+        PanelFrame frame = panel_frame_for(bar, PANEL_CLIPBOARD, width, height);
+        int max_scroll = MAX(0, (int)bar->clipboard_history->len -
+                                   clipboard_rows(&frame));
+        int step = dy > 0 ? 3 : -3;
+        bar->clipboard_scroll =
+            CLAMP(bar->clipboard_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
     }
     return TRUE;
 }
@@ -1796,7 +2074,9 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     win98_fill(cr, 0, 0, w, 1, win98_highlight);
     bar_clear_hits(bar);
 
-    const char *output = current_output(bar->niri);
+    const char *output = bar->active_output != NULL
+                             ? bar->active_output
+                             : current_output(bar->niri);
     double x = 2.0;
     double y = BUTTON_Y;
     double button_h = BUTTON_HEIGHT;
@@ -1871,7 +2151,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     int layout_w = (layout_name != NULL && layout_name[0] != '\0')
                        ? MAX(20, win98_text_width(layout_name, TRUE) + 8)
                        : 0;
-    double tray_w = 4.0 + 20.0 + 20.0 +
+    double tray_w = 4.0 + 20.0 + 20.0 + 20.0 +
                     (bar->battery_available ? 20.0 : 0.0) + layout_w + 4.0 +
                     clock_w + 4.0;
     double tray_x = w - 2.0 - tray_w;
@@ -1985,6 +2265,10 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     bar_add_hit(bar, HIT_VOLUME, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
+    win98_draw_clipboard_icon(cr, icon_x, icon_y);
+    bar_add_hit(bar, HIT_CLIPBOARD, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
+    icon_x += 20.0;
+
     if (layout_w > 0) {
         win98_draw_text(cr, icon_x, y + 2.0, layout_w, button_h - 4.0,
                    layout_name, WIN98_ALIGN_CENTER, TRUE, win98_text, FALSE);
@@ -2005,8 +2289,9 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
                         double y, gpointer user_data) {
     (void)gesture;
     (void)n_press;
-    NintyBar *bar = user_data;
-    BarHit *hit = bar_hit_at(bar, x, y);
+    BarSurface *surface = user_data;
+    NintyBar *bar = surface->bar;
+    BarHit *hit = bar_hit_at(surface->hits, x, y);
     if (hit == NULL) {
         return;
     }
@@ -2040,6 +2325,9 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     case HIT_BATTERY:
         open_panel(bar, PANEL_POWER);
         break;
+    case HIT_CLIPBOARD:
+        open_panel(bar, PANEL_CLIPBOARD);
+        break;
     default:
         break;
     }
@@ -2049,8 +2337,9 @@ static void bar_right_clicked(GtkGestureClick *gesture, int n_press,
                               double x, double y, gpointer user_data) {
     (void)gesture;
     (void)n_press;
-    NintyBar *bar = user_data;
-    BarHit *hit = bar_hit_at(bar, x, y);
+    BarSurface *surface = user_data;
+    NintyBar *bar = surface->bar;
+    BarHit *hit = bar_hit_at(surface->hits, x, y);
     if (hit == NULL) {
         return;
     }
@@ -2064,7 +2353,7 @@ static void bar_right_clicked(GtkGestureClick *gesture, int n_press,
 
 static gboolean bar_tick(gpointer user_data) {
     NintyBar *bar = user_data;
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
     return G_SOURCE_CONTINUE;
 }
 
@@ -2074,7 +2363,7 @@ static gboolean bar_slow_tick(gpointer user_data) {
     changed |= update_battery(bar);
     changed |= update_network(bar);
     if (changed) {
-        gtk_widget_queue_draw(bar->area);
+        bar_queue_redraw(bar);
         if (bar->panel_kind != PANEL_NONE) {
             gtk_widget_queue_draw(bar->panel_area);
         }
@@ -2087,7 +2376,7 @@ static void network_changed_cb(GNetworkMonitor *monitor,
     (void)monitor;
     NintyBar *bar = user_data;
     bar->network_available = available;
-    gtk_widget_queue_draw(bar->area);
+    bar_queue_redraw(bar);
     if (bar->panel_kind != PANEL_NONE) {
         gtk_widget_queue_draw(bar->panel_area);
     }
@@ -2125,20 +2414,35 @@ static void primary_monitor_geometry(GdkRectangle *geometry) {
     g_object_unref(monitor);
 }
 
-static GtkWidget *create_bar_window(NintyBar *bar) {
+static void create_bar_surface(NintyBar *bar, GdkMonitor *monitor) {
+    BarSurface *surface = g_new0(BarSurface, 1);
+    surface->bar = bar;
+    surface->monitor = monitor;
+    surface->hits = g_ptr_array_new_with_free_func(g_free);
+
+    GdkRectangle geometry = { 0 };
+    if (monitor != NULL) {
+        gdk_monitor_get_geometry(monitor, &geometry);
+        const char *connector = gdk_monitor_get_connector(monitor);
+        surface->output = g_strdup(connector);
+    } else {
+        primary_monitor_geometry(&geometry);
+    }
+
     GtkWidget *window = gtk_application_window_new(bar->app);
     gtk_widget_add_css_class(window, "nintysh");
     gtk_window_set_title(GTK_WINDOW(window), "nintysh");
     gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
     gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
-    GdkRectangle geometry = { 0 };
-    primary_monitor_geometry(&geometry);
     gtk_window_set_default_size(GTK_WINDOW(window), geometry.width,
                                 BAR_HEIGHT);
 
     gtk_layer_init_for_window(GTK_WINDOW(window));
     gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-bar");
     gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_TOP);
+    if (monitor != NULL) {
+        gtk_layer_set_monitor(GTK_WINDOW(window), monitor);
+    }
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
                          TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
@@ -2148,26 +2452,31 @@ static GtkWidget *create_bar_window(NintyBar *bar) {
     gtk_layer_set_keyboard_mode(GTK_WINDOW(window),
                                 GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
 
-    bar->area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(bar->area, -1, BAR_HEIGHT);
-    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(bar->area), bar_draw, bar,
-                                   NULL);
-    gtk_window_set_child(GTK_WINDOW(window), bar->area);
+    surface->window = window;
+    surface->area = gtk_drawing_area_new();
+    gtk_widget_set_size_request(surface->area, -1, BAR_HEIGHT);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(surface->area),
+                                   bar_surface_draw, surface, NULL);
+    gtk_window_set_child(GTK_WINDOW(window), surface->area);
 
     GtkGesture *click = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 1);
-    g_signal_connect(click, "pressed", G_CALLBACK(bar_clicked), bar);
-    gtk_widget_add_controller(bar->area, GTK_EVENT_CONTROLLER(click));
+    g_signal_connect(click, "pressed", G_CALLBACK(bar_clicked), surface);
+    gtk_widget_add_controller(surface->area, GTK_EVENT_CONTROLLER(click));
 
     GtkGesture *right_click = gtk_gesture_click_new();
     gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(right_click), 3);
     g_signal_connect(right_click, "pressed", G_CALLBACK(bar_right_clicked),
-                     bar);
-    gtk_widget_add_controller(bar->area,
+                     surface);
+    gtk_widget_add_controller(surface->area,
                               GTK_EVENT_CONTROLLER(right_click));
 
+    g_ptr_array_add(bar->surfaces, surface);
+    if (bar->area == NULL) {
+        bar->window = window;
+        bar->area = surface->area;
+    }
     gtk_window_present(GTK_WINDOW(window));
-    return window;
 }
 
 static GtkWidget *create_menu_window(NintyBar *bar) {
@@ -2343,6 +2652,8 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         open_panel(bar, PANEL_CALENDAR);
     } else if (g_strcmp0(parts[0], "network") == 0) {
         open_panel(bar, PANEL_NETWORK);
+    } else if (g_strcmp0(parts[0], "clipboard") == 0) {
+        open_panel(bar, PANEL_CLIPBOARD);
     } else if (g_strcmp0(parts[0], "power") == 0) {
         open_panel(bar, PANEL_POWER);
     } else if (g_strcmp0(parts[0], "layout") == 0) {
@@ -2365,6 +2676,9 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
     } else if (g_strcmp0(parts[0], "osd") == 0) {
         const char *text = strchr(command, ' ');
         osd_show_text(bar, text != NULL ? text + 1 : "");
+    } else if (g_strcmp0(parts[0], "run") == 0) {
+        const char *text = strchr(command, ' ');
+        run_shell_command(text != NULL ? text + 1 : "");
     }
 
     g_strfreev(parts);
@@ -2380,7 +2694,10 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->apps = g_ptr_array_new_with_free_func(g_object_unref);
     bar->menu_results = g_ptr_array_new();
     bar->menu_query = g_strdup("");
-    bar->hits = g_ptr_array_new_with_free_func(g_free);
+    bar->clipboard_history =
+        g_ptr_array_new_with_free_func((GDestroyNotify)g_free);
+    bar->surfaces = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)bar_surface_free);
     bar->icon_cache = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
     bar->app_index = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
@@ -2395,7 +2712,20 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     index_apps(bar);
     menu_update_results(bar);
 
-    bar->window = create_bar_window(bar);
+    GListModel *monitors =
+        gdk_display_get_monitors(gdk_display_get_default());
+    guint monitor_count =
+        monitors != NULL ? g_list_model_get_n_items(monitors) : 0;
+    if (monitor_count == 0) {
+        create_bar_surface(bar, NULL);
+    } else {
+        for (guint i = 0; i < monitor_count; i++) {
+            GdkMonitor *monitor = g_list_model_get_item(monitors, i);
+            create_bar_surface(bar, monitor);
+            g_object_unref(monitor);
+        }
+    }
+
     bar->menu_window = create_menu_window(bar);
     bar->panel_window = create_panel_window(bar);
     bar->osd_window = create_osd_window(bar);
@@ -2418,6 +2748,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
 
     bar->tick_source = g_timeout_add_seconds(1, bar_tick, bar);
     bar->slow_source = g_timeout_add_seconds(5, bar_slow_tick, bar);
+    bar->clipboard_source = g_timeout_add_seconds(2, clipboard_tick, bar);
+    clipboard_tick(bar);
     bar->control = ninty_control_new(control_command_cb, bar);
 
     return bar;
@@ -2433,6 +2765,9 @@ void ninty_bar_free(NintyBar *bar) {
     }
     if (bar->slow_source != 0) {
         g_source_remove(bar->slow_source);
+    }
+    if (bar->clipboard_source != 0) {
+        g_source_remove(bar->clipboard_source);
     }
     if (bar->osd_source != 0) {
         g_source_remove(bar->osd_source);
@@ -2451,8 +2786,10 @@ void ninty_bar_free(NintyBar *bar) {
     g_hash_table_destroy(bar->app_index);
     g_ptr_array_unref(bar->apps);
     g_ptr_array_unref(bar->menu_results);
+    g_ptr_array_unref(bar->clipboard_history);
+    g_free(bar->last_clipboard);
     g_free(bar->menu_query);
-    g_ptr_array_unref(bar->hits);
+    g_ptr_array_unref(bar->surfaces);
     g_hash_table_destroy(bar->icon_cache);
     g_object_unref(bar->icon_theme);
     g_free(bar);

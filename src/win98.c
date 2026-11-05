@@ -304,3 +304,24 @@ void win98_draw_battery_icon(cairo_t *cr, double x, double y, int percent,
 
     cairo_restore(cr);
 }
+
+
+void win98_draw_clipboard_icon(cairo_t *cr, double x, double y) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    win98_fill(cr, 1, 3, 14, 12, win98_face);
+    win98_bevel(cr, 1, 3, 14, 12, WIN98_BEVEL_RAISED);
+    win98_fill(cr, 3, 5, 10, 8, win98_white);
+    win98_fill(cr, 3, 5, 10, 1, win98_shadow);
+
+    win98_fill(cr, 5, 1, 6, 4, win98_light);
+    win98_bevel(cr, 5, 1, 6, 4, WIN98_BEVEL_RAISED);
+    win98_fill(cr, 7, 2, 2, 2, win98_shadow);
+
+    win98_fill(cr, 5, 7, 6, 1, win98_shadow);
+    win98_fill(cr, 5, 9, 6, 1, win98_shadow);
+    win98_fill(cr, 5, 11, 4, 1, win98_shadow);
+
+    cairo_restore(cr);
+}

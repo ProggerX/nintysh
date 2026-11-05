@@ -34,6 +34,10 @@
               json-glib
             ];
 
+            gappsWrapperArgs = [
+              "--prefix" "PATH" ":" (pkgs.lib.makeBinPath [ pkgs.wl-clipboard ])
+            ];
+
             buildPhase = ''
               runHook preBuild
               just build
