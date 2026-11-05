@@ -55,6 +55,9 @@
           default = ./nix/hm.nix;
           nintysh = ./nix/hm.nix;
         };
+
+        homeModules.default = ./nix/hm.nix;
+        homeManagerModules.default = ./nix/hm.nix;
       };
     };
 }
