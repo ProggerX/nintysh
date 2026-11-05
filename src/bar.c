@@ -84,6 +84,7 @@ struct NintyBar {
     GPtrArray *menu_results;
     GPtrArray *hits;
     GHashTable *icon_cache;
+    GHashTable *app_index;
     GtkIconTheme *icon_theme;
 
     guint tick_source;
@@ -210,6 +211,38 @@ static void format_clock(char *buffer, gsize size) {
     g_date_time_unref(now);
 }
 
+static gboolean paintable_is_monochrome(GtkIconPaintable *paintable) {
+    GFile *file = gtk_icon_paintable_get_file(paintable);
+    if (file == NULL) {
+        return FALSE;
+    }
+
+    char *path = g_file_get_path(file);
+    gboolean monochrome = FALSE;
+    if (path != NULL) {
+        monochrome = strstr(path, "/symbolic/") != NULL ||
+                     g_str_has_suffix(path, "-symbolic.svg");
+        if (!monochrome && g_str_has_suffix(path, ".svg")) {
+            char *contents = NULL;
+            gsize length = 0;
+            GError *error = NULL;
+            if (g_file_load_contents(file, NULL, &contents, &length, NULL,
+                                     &error)) {
+                if (g_strstr_len(contents, (gssize)length, "currentColor") !=
+                        NULL ||
+                    g_strstr_len(contents, (gssize)length, "ColorScheme-") !=
+                        NULL) {
+                    monochrome = TRUE;
+                }
+                g_free(contents);
+            }
+            g_clear_error(&error);
+        }
+    }
+    g_free(path);
+    return monochrome;
+}
+
 static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
                                     const char *cache_key) {
     if (icon == NULL) {
@@ -222,20 +255,61 @@ static GtkIconPaintable *lookup_icon(NintyBar *bar, GIcon *icon,
         return paintable;
     }
 
-    paintable = gtk_icon_theme_lookup_by_gicon(
-        bar->icon_theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
+    GtkIconTheme *global =
+        gtk_icon_theme_get_for_display(gdk_display_get_default());
+    GtkIconPaintable *global_icon = gtk_icon_theme_lookup_by_gicon(
+        global, icon, 20, 1, GTK_TEXT_DIR_NONE,
         GTK_ICON_LOOKUP_FORCE_REGULAR);
-    if (paintable == NULL) {
-        GtkIconTheme *theme =
-            gtk_icon_theme_get_for_display(gdk_display_get_default());
+
+    paintable = NULL;
+    if (global_icon != NULL && !paintable_is_monochrome(global_icon)) {
+        paintable = global_icon;
+        global_icon = NULL;
+    } else {
         paintable = gtk_icon_theme_lookup_by_gicon(
-            theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
+            bar->icon_theme, icon, 20, 1, GTK_TEXT_DIR_NONE,
             GTK_ICON_LOOKUP_FORCE_REGULAR);
+        if (paintable == NULL) {
+            paintable = global_icon;
+            global_icon = NULL;
+        }
     }
+    if (global_icon != NULL) {
+        g_object_unref(global_icon);
+    }
+
     if (paintable != NULL) {
         g_hash_table_insert(bar->icon_cache, g_strdup(cache_key), paintable);
     }
     return paintable;
+}
+
+static char *app_index_key(const char *value) {
+    if (value == NULL) {
+        return NULL;
+    }
+    char *key = g_utf8_casefold(value, -1);
+    if (g_str_has_suffix(key, ".desktop")) {
+        key[strlen(key) - strlen(".desktop")] = '\0';
+    }
+    return key;
+}
+
+static void index_apps(NintyBar *bar) {
+    for (guint i = 0; i < bar->apps->len; i++) {
+        GAppInfo *app = g_ptr_array_index(bar->apps, i);
+        const char *id = g_app_info_get_id(app);
+        char *key = app_index_key(id);
+        if (key != NULL) {
+            g_hash_table_insert(bar->app_index, key, app);
+        }
+        const char *executable = g_app_info_get_executable(app);
+        const char *base = executable != NULL ? strrchr(executable, '/') : NULL;
+        key = app_index_key(base != NULL ? base + 1 : executable);
+        if (key != NULL) {
+            g_hash_table_insert(bar->app_index, key, app);
+        }
+    }
 }
 
 static GtkIconPaintable *app_icon(NintyBar *bar, GAppInfo *app) {
@@ -257,6 +331,19 @@ static GtkIconPaintable *app_icon(NintyBar *bar, GAppInfo *app) {
 static GtkIconPaintable *window_icon(NintyBar *bar, NiriWindow *window) {
     if (window->app_id == NULL || window->app_id[0] == '\0') {
         return NULL;
+    }
+
+    char *lookup_key = app_index_key(window->app_id);
+    GAppInfo *app =
+        lookup_key != NULL
+            ? g_hash_table_lookup(bar->app_index, lookup_key)
+            : NULL;
+    g_free(lookup_key);
+    if (app != NULL) {
+        GtkIconPaintable *paintable = app_icon(bar, app);
+        if (paintable != NULL) {
+            return paintable;
+        }
     }
 
     char *key = g_strdup_printf("appid:%s", window->app_id);
@@ -2296,6 +2383,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->hits = g_ptr_array_new_with_free_func(g_free);
     bar->icon_cache = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
+    bar->app_index = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
+                                           NULL);
     bar->icon_theme = gtk_icon_theme_new();
     gtk_icon_theme_set_theme_name(bar->icon_theme, "hicolor");
     bar->menu_hover = -1;
@@ -2303,6 +2392,7 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
 
     load_css();
     load_apps(bar);
+    index_apps(bar);
     menu_update_results(bar);
 
     bar->window = create_bar_window(bar);
@@ -2358,6 +2448,7 @@ void ninty_bar_free(NintyBar *bar) {
         niri_client_free(bar->niri);
     }
 
+    g_hash_table_destroy(bar->app_index);
     g_ptr_array_unref(bar->apps);
     g_ptr_array_unref(bar->menu_results);
     g_free(bar->menu_query);
