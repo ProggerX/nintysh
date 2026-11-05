@@ -38,7 +38,7 @@
             ];
           };
 
-          formatter = pkgs.nixfmt-rfc-style;
+          formatter = pkgs.nixfmt;
         };
 
       flake = {
@@ -46,6 +46,10 @@
           pkgs.callPackage ./nix/package.nix {
             inherit extraConfig wrapperArgs;
           };
+
+        overlays.default = final: prev: {
+          nintysh = final.callPackage ./nix/package.nix { };
+        };
 
         modules.homeManager = {
           default = ./nix/hm.nix;

@@ -1553,7 +1553,8 @@ static void panel_draw_power(cairo_t *cr, NintyBar *bar,
 }
 
 static int clipboard_rows(const PanelFrame *frame) {
-    return (int)((frame->h - frame->title_h - 16.0) / 20.0);
+    return (int)((frame->h - frame->title_h - 16.0) /
+                 NINTYSH_CLIPBOARD_ROW_HEIGHT);
 }
 
 static int clipboard_row_at(const PanelFrame *frame, double y) {
@@ -1561,7 +1562,7 @@ static int clipboard_row_at(const PanelFrame *frame, double y) {
     if (y < list_y) {
         return -1;
     }
-    int row = (int)((y - list_y) / 20.0);
+    int row = (int)((y - list_y) / NINTYSH_CLIPBOARD_ROW_HEIGHT);
     return row < clipboard_rows(frame) ? row : -1;
 }
 
@@ -1578,7 +1579,8 @@ static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
     bar->clipboard_scroll = CLAMP(bar->clipboard_scroll, 0, max_scroll);
 
     if (count == 0) {
-        win98_draw_text(cr, list_x, list_y, list_w, 20.0,
+        win98_draw_text(cr, list_x, list_y, list_w,
+                        NINTYSH_CLIPBOARD_ROW_HEIGHT,
                         "Clipboard history is empty", WIN98_ALIGN_CENTER,
                         FALSE, win98_text_disabled, TRUE);
     }
@@ -1588,13 +1590,15 @@ static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
         if (index >= count) {
             break;
         }
-        double y = list_y + row * 20.0;
+        double y = list_y + row * NINTYSH_CLIPBOARD_ROW_HEIGHT;
         gboolean selected = index == bar->panel_hover;
         if (selected) {
-            win98_fill(cr, list_x, y, list_w, 20.0, win98_navy);
+            win98_fill(cr, list_x, y, list_w,
+                       NINTYSH_CLIPBOARD_ROW_HEIGHT, win98_navy);
         }
         const char *text = g_ptr_array_index(bar->clipboard_history, index);
-        win98_draw_text(cr, list_x + 4.0, y, list_w - 8.0, 20.0, text,
+        win98_draw_text(cr, list_x + 4.0, y, list_w - 8.0,
+                        NINTYSH_CLIPBOARD_ROW_HEIGHT, text,
                         WIN98_ALIGN_LEFT, FALSE,
                         selected ? win98_white : win98_text, TRUE);
     }
