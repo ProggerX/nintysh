@@ -7,7 +7,10 @@ let
   color = value: "0x" + lib.removePrefix "#" value;
   mkColor = default: lib.mkOption { type = colorType; inherit default; };
 
-  renderConfig = settings:
+  renderConfig = cfg:
+    let
+      settings = cfg.settings;
+    in
     lib.concatStringsSep "\n" ([
       "#define NINTYSH_FONT_FAMILY ${builtins.toJSON settings.font.family}"
       "#define NINTYSH_FONT_PX ${toString settings.font.size}"
@@ -46,7 +49,7 @@ let
       "#define NINTYSH_COLOR_TITLE_BOTTOM ${color settings.colors.titleBottom}"
     ] ++ lib.optional (settings.osd.marginBottom != null)
       "#define NINTYSH_OSD_MARGIN_BOTTOM ${toString settings.osd.marginBottom}"
-      ++ lib.optional (settings.extraConfig != "") settings.extraConfig);
+      ++ lib.optional (cfg.extraConfig != "") cfg.extraConfig);
 in
 {
   options.programs.nintysh = {
@@ -55,7 +58,7 @@ in
     package = lib.mkOption {
       type = lib.types.package;
       default = pkgs.callPackage ./package.nix {
-        extraConfig = renderConfig cfg.settings;
+        extraConfig = renderConfig cfg;
         inherit (cfg) wrapperArgs;
       };
       defaultText = lib.literalExpression "nintysh configured by programs.nintysh.settings";
@@ -74,15 +77,15 @@ in
       description = "Extra arguments passed to the Nix binary wrapper.";
     };
 
+    extraConfig = lib.mkOption {
+      type = lib.types.lines;
+      default = "";
+      description = "Extra preprocessor definitions written after the generated settings config.";
+    };
+
     settings = lib.mkOption {
       type = lib.types.submodule {
         options = {
-          extraConfig = lib.mkOption {
-            type = lib.types.lines;
-            default = "";
-            description = "Extra preprocessor definitions written after the generated config.";
-          };
-
           font = {
             family = lib.mkOption {
               type = lib.types.str;
