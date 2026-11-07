@@ -2321,7 +2321,15 @@ static void notification_method_call(GDBusConnection *connection,
         g_variant_get(parameters, "(u)", &id);
         int index = notification_index_for_id(bar, id);
         if (index >= 0) {
-            notification_remove_at(bar, (guint)index, 3);
+            NintyNotification *notification =
+                g_ptr_array_index(bar->notifications, (guint)index);
+            notification->active = FALSE;
+            notification->read = TRUE;
+            notification_emit_closed(bar, id, 3);
+            notification_popup_update(bar);
+            if (bar->panel_kind == PANEL_NOTIFICATIONS) {
+                gtk_widget_queue_draw(bar->panel_area);
+            }
         }
         g_dbus_method_invocation_return_value(invocation, NULL);
         return;
@@ -4776,6 +4784,9 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
         visualizer_start(bar->visualizer);
     } else {
         visualizer_stop(bar->visualizer);
+    }
+    if (kind == PANEL_NOTIFICATIONS || kind == PANEL_CONTROL_CENTER) {
+        notification_popup_destroy(bar);
     }
     if (kind == PANEL_CLIPBOARD) {
         g_free(bar->clipboard_query);
@@ -7462,7 +7473,8 @@ static gboolean notification_popup_update_cb(gpointer user_data) {
 }
 
 static void notification_popup_update(NintyBar *bar) {
-    if (bar->locked) {
+    if (bar->locked || bar->panel_kind == PANEL_NOTIFICATIONS ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
         notification_popup_destroy(bar);
         return;
     }
