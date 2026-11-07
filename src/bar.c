@@ -114,6 +114,7 @@ typedef struct {
     char **actions;
     GdkTexture *image;
     gboolean active;
+    gboolean read;
     guint expire_source;
     gint64 timestamp;
 } NintyNotification;
@@ -175,6 +176,18 @@ typedef struct {
     gboolean interactive;
 } LockSurface;
 
+typedef struct {
+    NintyBar *bar;
+    GtkWidget *window;
+    GtkWidget *area;
+    int width;
+    int height;
+    double x;
+    double y;
+    double dx;
+    double dy;
+} ScreensaverSurface;
+
 struct NintyBar {
     GtkApplication *app;
     GtkWidget *window;
@@ -203,6 +216,10 @@ struct NintyBar {
     GPtrArray *menu_results;
     GPtrArray *surfaces;
     GPtrArray *lock_surfaces;
+    GPtrArray *screensaver_surfaces;
+    guint screensaver_tick_source;
+    guint screensaver_stop_source;
+    gint64 screensaver_activated_at;
     GPtrArray *active_hits;
     const char *active_output;
     GtkWidget *lock_window;
@@ -273,7 +290,13 @@ struct NintyBar {
     int display_drag_index;
     int display_drag_kind;
     double volume_drag_x0;
+    PanelFrame active_drag_frame;
+    gboolean active_drag_frame_valid;
+    double panel_mouse_x;
+    double panel_mouse_y;
     int panel_hover;
+    PanelKind control_hover_kind;
+    int control_hover_row;
     int clipboard_scroll;
     int clipboard_selected;
     int notification_scroll;
@@ -303,6 +326,7 @@ static void notification_emit_closed(NintyBar *bar, guint id,
 static void update_wifi(NintyBar *bar);
 static void ninty_lock_screen(NintyBar *bar);
 static void ninty_unlock_screen(NintyBar *bar);
+static void screensaver_start(NintyBar *bar);
 
 static void bar_clear_hits(NintyBar *bar) {
     if (bar->active_hits == NULL) {
@@ -2124,6 +2148,7 @@ static guint notification_add(NintyBar *bar, const char *app_name,
     notification->image = image;
     notification->timestamp = g_get_real_time();
     notification->active = !bar->locked;
+    notification->read = FALSE;
     notification_trim(bar);
     if (!bar->locked) {
         notification_schedule_expiry(bar, notification, expire_timeout);
@@ -3013,7 +3038,7 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
     }
     case PANEL_SESSION:
         frame.w = 188.0;
-        frame.h = 152.0;
+        frame.h = 176.0;
         break;
     case PANEL_DISPLAY: {
         int outputs = MAX(1, (int)gamma_client_output_count(bar->gamma));
@@ -4388,12 +4413,13 @@ static void panel_draw_wallpaper(cairo_t *cr, NintyBar *bar,
 }
 
 static const char *session_menu_items[] = {
-    "Lock", "Suspend", "Log Out", NULL, "Reboot", "Shut Down"
+    "Lock", "Suspend", "Log Out", NULL, "Reboot", "Shut Down",
+    "ADHD Mode"
 };
 
 static int session_menu_row_at(const PanelFrame *frame, double y) {
     double row_y = frame->y + frame->title_h + 4.0;
-    for (int row = 0; row < 6; row++) {
+    for (int row = 0; row < (int)G_N_ELEMENTS(session_menu_items); row++) {
         if (session_menu_items[row] == NULL) {
             row_y += 6.0;
             continue;
@@ -4414,7 +4440,7 @@ static void panel_draw_session(cairo_t *cr, NintyBar *bar,
     double w = frame->w - 8.0;
     double y = frame->y + frame->title_h + 4.0;
 
-    for (int row = 0; row < 6; row++) {
+    for (int row = 0; row < (int)G_N_ELEMENTS(session_menu_items); row++) {
         if (session_menu_items[row] == NULL) {
             win98_fill(cr, x, y + 2.0, w, 1.0, win98_shadow);
             win98_fill(cr, x, y + 3.0, w, 1.0, win98_highlight);
@@ -4449,6 +4475,9 @@ static void session_menu_activate(NintyBar *bar, int row) {
         break;
     case 5:
         run_shell_command(NINTYSH_SHUTDOWN_COMMAND);
+        break;
+    case 6:
+        screensaver_start(bar);
         break;
     default:
         break;
@@ -4538,6 +4567,29 @@ static int control_center_layout(NintyBar *bar, double screen_w,
     return count;
 }
 
+static gboolean control_center_frame_at(NintyBar *bar, double screen_w,
+                                        double screen_h, double x, double y,
+                                        PanelKind *kind,
+                                        PanelFrame *frame) {
+    PanelFrame frames[16];
+    PanelKind kinds[16];
+    int count = control_center_layout(bar, screen_w, screen_h, frames,
+                                      kinds, 16);
+    for (int i = 0; i < count; i++) {
+        if (x >= frames[i].x && x < frames[i].x + frames[i].w &&
+            y >= frames[i].y && y < frames[i].y + frames[i].h) {
+            if (kind != NULL) {
+                *kind = kinds[i];
+            }
+            if (frame != NULL) {
+                *frame = frames[i];
+            }
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
 static void panel_draw_kind(cairo_t *cr, NintyBar *bar, PanelKind kind,
                             const PanelFrame *frame) {
     switch (kind) {
@@ -4609,7 +4661,13 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
         int count = control_center_layout(bar, logical_w, logical_h,
                                           frames, kinds, 16);
         for (int i = 0; i < count; i++) {
+            int saved_hover = bar->panel_hover;
+            bar->panel_hover =
+                kinds[i] == bar->control_hover_kind
+                    ? bar->control_hover_row
+                    : -1;
             panel_draw_kind(cr, bar, kinds[i], &frames[i]);
+            bar->panel_hover = saved_hover;
         }
     } else {
         PanelFrame frame =
@@ -4702,6 +4760,8 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
 
     bar->panel_kind = kind;
     bar->panel_hover = -1;
+    bar->control_hover_kind = PANEL_NONE;
+    bar->control_hover_row = -1;
     bar->volume_dragging = FALSE;
     bar->media_dragging = FALSE;
     bar->display_dragging = FALSE;
@@ -4742,6 +4802,8 @@ static void close_panel(NintyBar *bar) {
     bar->network_password_ssid = NULL;
     bar->network_password = NULL;
     bar->panel_hover = -1;
+    bar->control_hover_kind = PANEL_NONE;
+    bar->control_hover_row = -1;
     gtk_widget_set_visible(bar->panel_window, FALSE);
     bar_queue_redraw(bar);
 }
@@ -4858,7 +4920,15 @@ static void panel_handle_click(NintyBar *bar, PanelKind kind,
         if (row >= 0 && x >= list_x && x < list_x + list_w) {
             int index = bar->notification_scroll + row;
             if (index < (int)bar->notifications->len) {
-                notification_remove_at(bar, (guint)index, 3);
+                if (NINTYSH_NOTIFICATION_DELETE_ON_READ) {
+                    notification_remove_at(bar, (guint)index, 3);
+                } else {
+                    NintyNotification *notification =
+                        g_ptr_array_index(bar->notifications,
+                                          (guint)index);
+                    notification->read = TRUE;
+                    gtk_widget_queue_draw(bar->panel_area);
+                }
             }
         }
         return;
@@ -5126,29 +5196,20 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
     panel_handle_click(bar, bar->panel_kind, &frame, x, y);
 }
 
-static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
-                             double start_y, gpointer user_data) {
-    (void)gesture;
-    NintyBar *bar = user_data;
-    double scale = panel_scale();
-    start_x /= scale;
-    start_y /= scale;
-    double width = gtk_widget_get_width(bar->panel_area) / scale;
-    double height = gtk_widget_get_height(bar->panel_area) / scale;
-
-    if (bar->panel_kind == PANEL_MEDIA) {
+static void panel_drag_begin_kind(NintyBar *bar, PanelKind kind,
+                                  const PanelFrame *frame, double start_x,
+                                  double start_y) {
+    if (kind == PANEL_MEDIA) {
         const MprisState *state = mpris_client_state(bar->mpris);
         if (state == NULL || !state->available ||
             state->length_us <= 0 || !state->can_seek) {
             return;
         }
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_MEDIA, width, height);
         double px = 0;
         double py = 0;
         double pw = 0;
         double ph = 0;
-        media_progress_rect(&frame, &px, &py, &pw, &ph);
+        media_progress_rect(frame, &px, &py, &pw, &ph);
         if (start_x >= px - 6.0 && start_x < px + pw + 6.0 &&
             start_y >= py - 8.0 && start_y < py + ph + 8.0) {
             bar->media_dragging = TRUE;
@@ -5157,17 +5218,15 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
         return;
     }
 
-    if (bar->panel_kind == PANEL_DISPLAY) {
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_DISPLAY, width, height);
-        int index = display_index_at(bar, &frame, start_y);
+    if (kind == PANEL_DISPLAY) {
+        int index = display_index_at(bar, frame, start_y);
         if (index < 0) {
             return;
         }
         double brightness_y =
-            display_brightness_y(&frame, (guint)index);
+            display_brightness_y(frame, (guint)index);
         double temperature_y =
-            display_temperature_y(&frame, (guint)index);
+            display_temperature_y(frame, (guint)index);
         if (start_y >= brightness_y - 10.0 &&
             start_y < brightness_y + 18.0) {
             bar->display_dragging = TRUE;
@@ -5184,18 +5243,17 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
         return;
     }
 
-    if (bar->panel_kind != PANEL_VOLUME) {
+    if (kind != PANEL_VOLUME) {
         return;
     }
 
-    PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
     AudioGeometry geometry;
-    audio_geometry(bar, &frame, &geometry);
+    audio_geometry(bar, frame, &geometry);
 
     double tx = 0;
     double tw = 0;
     double th = 0;
-    audio_track_rect(&frame, geometry.out_track_y, &tx, &tw, &th);
+    audio_track_rect(frame, geometry.out_track_y, &tx, &tw, &th);
     if (start_x >= tx - 6.0 && start_x < tx + tw + 6.0 &&
         start_y >= geometry.out_track_y - 12.0 &&
         start_y < geometry.out_track_y + th + 14.0) {
@@ -5205,7 +5263,7 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
         return;
     }
 
-    audio_track_rect(&frame, geometry.in_track_y, &tx, &tw, &th);
+    audio_track_rect(frame, geometry.in_track_y, &tx, &tw, &th);
     if (start_x >= tx - 6.0 && start_x < tx + tw + 6.0 &&
         start_y >= geometry.in_track_y - 12.0 &&
         start_y < geometry.in_track_y + th + 14.0) {
@@ -5215,6 +5273,32 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
     }
 }
 
+static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
+                             double start_y, gpointer user_data) {
+    (void)gesture;
+    NintyBar *bar = user_data;
+    double scale = panel_scale();
+    start_x /= scale;
+    start_y /= scale;
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+
+    PanelKind kind = bar->panel_kind;
+    PanelFrame frame = { 0 };
+    if (kind == PANEL_CONTROL_CENTER) {
+        if (!control_center_frame_at(bar, width, height, start_x,
+                                     start_y, &kind, &frame)) {
+            return;
+        }
+    } else {
+        frame = panel_frame_for(bar, kind, width, height);
+    }
+
+    bar->active_drag_frame = frame;
+    bar->active_drag_frame_valid = TRUE;
+    panel_drag_begin_kind(bar, kind, &frame, start_x, start_y);
+}
+
 static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
                               double offset_y, gpointer user_data) {
     (void)gesture;
@@ -5222,16 +5306,16 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
     NintyBar *bar = user_data;
     double scale = panel_scale();
     offset_x /= scale;
-    double width = gtk_widget_get_width(bar->panel_area) / scale;
-    double height = gtk_widget_get_height(bar->panel_area) / scale;
+    if (!bar->active_drag_frame_valid) {
+        return;
+    }
+    PanelFrame frame = bar->active_drag_frame;
 
     if (bar->media_dragging) {
         const MprisState *state = mpris_client_state(bar->mpris);
         if (state == NULL || state->length_us <= 0) {
             return;
         }
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_MEDIA, width, height);
         double px = 0;
         double py = 0;
         double pw = 0;
@@ -5247,8 +5331,6 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
     }
 
     if (bar->display_dragging) {
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_DISPLAY, width, height);
         double fraction = CLAMP(
             (bar->volume_drag_x0 + offset_x - (frame.x + 18.0)) /
                 (frame.w - 36.0),
@@ -5270,7 +5352,6 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
         return;
     }
 
-    PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
     int percent = audio_percent_from_x(
         &frame, bar->volume_drag_x0 + offset_x);
     if (bar->volume_drag_source) {
@@ -5286,6 +5367,7 @@ static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
     (void)offset_x;
     (void)offset_y;
     NintyBar *bar = user_data;
+    bar->active_drag_frame_valid = FALSE;
     if (bar->display_dragging) {
         bar->display_dragging = FALSE;
         gtk_widget_queue_draw(bar->panel_area);
@@ -5309,45 +5391,119 @@ static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
     }
 }
 
+static int panel_hover_at(NintyBar *bar, PanelKind kind,
+                          const PanelFrame *frame, double y) {
+    (void)bar;
+    if (kind == PANEL_TASKMENU) {
+        return task_menu_row_at(frame, y);
+    }
+    if (kind == PANEL_CLIPBOARD) {
+        return clipboard_row_at(frame, y);
+    }
+    if (kind == PANEL_NETWORK) {
+        return network_row_at(frame, y);
+    }
+    if (kind == PANEL_SESSION) {
+        return session_menu_row_at(frame, y);
+    }
+    if (kind == PANEL_MEDIA) {
+        return media_player_row_at(frame, y);
+    }
+    if (kind == PANEL_WALLPAPER) {
+        return wallpaper_row_at(frame, y);
+    }
+    if (kind == PANEL_NOTIFICATIONS) {
+        return notification_row_at(frame, y);
+    }
+    return -1;
+}
+
 static void panel_motion(GtkEventControllerMotion *controller, double x,
                          double y, gpointer user_data) {
     (void)controller;
-    (void)x;
     NintyBar *bar = user_data;
-    if (bar->panel_kind != PANEL_TASKMENU &&
-        bar->panel_kind != PANEL_CLIPBOARD &&
-        bar->panel_kind != PANEL_NOTIFICATIONS &&
-        bar->panel_kind != PANEL_NETWORK &&
-        bar->panel_kind != PANEL_SESSION &&
-        bar->panel_kind != PANEL_MEDIA &&
-        bar->panel_kind != PANEL_WALLPAPER) {
+    double scale = panel_scale();
+    x /= scale;
+    y /= scale;
+    bar->panel_mouse_x = x;
+    bar->panel_mouse_y = y;
+
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+
+    if (bar->panel_kind == PANEL_CONTROL_CENTER) {
+        PanelKind kind = PANEL_NONE;
+        PanelFrame frame = { 0 };
+        int row = -1;
+        if (control_center_frame_at(bar, width, height, x, y, &kind,
+                                    &frame)) {
+            row = panel_hover_at(bar, kind, &frame, y);
+        }
+        if (kind != bar->control_hover_kind ||
+            row != bar->control_hover_row) {
+            bar->control_hover_kind = kind;
+            bar->control_hover_row = row;
+            gtk_widget_queue_draw(bar->panel_area);
+        }
         return;
     }
 
-    double scale = panel_scale();
-    y /= scale;
-    double width = gtk_widget_get_width(bar->panel_area) / scale;
-    double height = gtk_widget_get_height(bar->panel_area) / scale;
-    PanelFrame frame =
-        panel_frame_for(bar, bar->panel_kind, width, height);
     int hover = -1;
-    if (bar->panel_kind == PANEL_TASKMENU) {
-        hover = task_menu_row_at(&frame, y);
-    } else if (bar->panel_kind == PANEL_CLIPBOARD) {
-        hover = clipboard_row_at(&frame, y);
-    } else if (bar->panel_kind == PANEL_NETWORK) {
-        hover = network_row_at(&frame, y);
-    } else if (bar->panel_kind == PANEL_SESSION) {
-        hover = session_menu_row_at(&frame, y);
-    } else if (bar->panel_kind == PANEL_MEDIA) {
-        hover = media_player_row_at(&frame, y);
-    } else if (bar->panel_kind == PANEL_WALLPAPER) {
-        hover = wallpaper_row_at(&frame, y);
-    } else {
-        hover = notification_row_at(&frame, y);
+    if (bar->panel_kind == PANEL_TASKMENU ||
+        bar->panel_kind == PANEL_CLIPBOARD ||
+        bar->panel_kind == PANEL_NOTIFICATIONS ||
+        bar->panel_kind == PANEL_NETWORK ||
+        bar->panel_kind == PANEL_SESSION ||
+        bar->panel_kind == PANEL_MEDIA ||
+        bar->panel_kind == PANEL_WALLPAPER) {
+        PanelFrame frame =
+            panel_frame_for(bar, bar->panel_kind, width, height);
+        hover = panel_hover_at(bar, bar->panel_kind, &frame, y);
     }
+
     if (hover != bar->panel_hover) {
         bar->panel_hover = hover;
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+}
+
+static void panel_scroll_action(NintyBar *bar, PanelKind kind,
+                                const PanelFrame *frame, double dy) {
+    if (kind == PANEL_MEDIA) {
+        gint64 offset = dy > 0 ? -5000000 : 5000000;
+        mpris_client_seek(bar->mpris, offset);
+        mpris_client_poll(bar->mpris);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (kind == PANEL_VOLUME) {
+        int delta = dy > 0 ? -2 : 2;
+        apply_volume(bar, bar->volume_percent + delta, TRUE);
+    } else if (kind == PANEL_CLIPBOARD) {
+        int max_scroll = MAX(0, (int)bar->clipboard_matches->len -
+                                   clipboard_rows(frame));
+        int step = dy > 0 ? 3 : -3;
+        bar->clipboard_scroll =
+            CLAMP(bar->clipboard_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (kind == PANEL_NETWORK) {
+        int max_scroll = MAX(0, (int)bar->wifi_networks->len -
+                                   network_rows(frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->network_scroll =
+            CLAMP(bar->network_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (kind == PANEL_WALLPAPER) {
+        int max_scroll = MAX(0, (int)bar->wallpaper_files->len -
+                                   wallpaper_rows(frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->wallpaper_scroll =
+            CLAMP(bar->wallpaper_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (kind == PANEL_NOTIFICATIONS) {
+        int max_scroll = MAX(0, (int)bar->notifications->len -
+                                   notification_rows(frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->notification_scroll =
+            CLAMP(bar->notification_scroll + step, 0, max_scroll);
         gtk_widget_queue_draw(bar->panel_area);
     }
 }
@@ -5358,58 +5514,23 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
     (void)dx;
     NintyBar *bar = user_data;
     double scale = panel_scale();
-    if (bar->panel_kind == PANEL_MEDIA) {
-        gint64 offset = dy > 0 ? -5000000 : 5000000;
-        mpris_client_seek(bar->mpris, offset);
-        mpris_client_poll(bar->mpris);
-        gtk_widget_queue_draw(bar->panel_area);
-    } else if (bar->panel_kind == PANEL_VOLUME) {
-        int delta = dy > 0 ? -2 : 2;
-        apply_volume(bar, bar->volume_percent + delta, TRUE);
-    } else if (bar->panel_kind == PANEL_CLIPBOARD) {
-        double width = gtk_widget_get_width(bar->panel_area) / scale;
-        double height = gtk_widget_get_height(bar->panel_area) / scale;
-        PanelFrame frame = panel_frame_for(bar, PANEL_CLIPBOARD, width, height);
-        int max_scroll = MAX(0, (int)bar->clipboard_matches->len -
-                                   clipboard_rows(&frame));
-        int step = dy > 0 ? 3 : -3;
-        bar->clipboard_scroll =
-            CLAMP(bar->clipboard_scroll + step, 0, max_scroll);
-        gtk_widget_queue_draw(bar->panel_area);
-    } else if (bar->panel_kind == PANEL_NETWORK) {
-        double width = gtk_widget_get_width(bar->panel_area) / scale;
-        double height = gtk_widget_get_height(bar->panel_area) / scale;
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_NETWORK, width, height);
-        int max_scroll = MAX(0, (int)bar->wifi_networks->len -
-                                   network_rows(&frame));
-        int step = dy > 0 ? 2 : -2;
-        bar->network_scroll =
-            CLAMP(bar->network_scroll + step, 0, max_scroll);
-        gtk_widget_queue_draw(bar->panel_area);
-    } else if (bar->panel_kind == PANEL_WALLPAPER) {
-        double width = gtk_widget_get_width(bar->panel_area) / scale;
-        double height = gtk_widget_get_height(bar->panel_area) / scale;
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_WALLPAPER, width, height);
-        int max_scroll = MAX(0, (int)bar->wallpaper_files->len -
-                                   wallpaper_rows(&frame));
-        int step = dy > 0 ? 2 : -2;
-        bar->wallpaper_scroll =
-            CLAMP(bar->wallpaper_scroll + step, 0, max_scroll);
-        gtk_widget_queue_draw(bar->panel_area);
-    } else if (bar->panel_kind == PANEL_NOTIFICATIONS) {
-        double width = gtk_widget_get_width(bar->panel_area) / scale;
-        double height = gtk_widget_get_height(bar->panel_area) / scale;
-        PanelFrame frame =
-            panel_frame_for(bar, PANEL_NOTIFICATIONS, width, height);
-        int max_scroll = MAX(0, (int)bar->notifications->len -
-                                   notification_rows(&frame));
-        int step = dy > 0 ? 2 : -2;
-        bar->notification_scroll =
-            CLAMP(bar->notification_scroll + step, 0, max_scroll);
-        gtk_widget_queue_draw(bar->panel_area);
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+
+    if (bar->panel_kind == PANEL_CONTROL_CENTER) {
+        PanelKind kind = PANEL_NONE;
+        PanelFrame frame = { 0 };
+        if (control_center_frame_at(bar, width, height,
+                                    bar->panel_mouse_x,
+                                    bar->panel_mouse_y, &kind, &frame)) {
+            panel_scroll_action(bar, kind, &frame, dy);
+        }
+        return TRUE;
     }
+
+    PanelFrame frame =
+        panel_frame_for(bar, bar->panel_kind, width, height);
+    panel_scroll_action(bar, bar->panel_kind, &frame, dy);
     return TRUE;
 }
 
@@ -5940,6 +6061,12 @@ static gboolean lock_key_pressed(GtkEventControllerKey *controller,
         }
         return TRUE;
     }
+    if ((state & GDK_CONTROL_MASK) && keyval == GDK_KEY_u) {
+        g_free(bar->lock_password);
+        bar->lock_password = g_strdup("");
+        lock_queue_draw(bar);
+        return TRUE;
+    }
     if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)) {
         return FALSE;
     }
@@ -6101,6 +6228,236 @@ static void ninty_lock_screen(NintyBar *bar) {
     if (bar->lock_area != NULL) {
         gtk_widget_grab_focus(bar->lock_area);
     }
+}
+
+#define SCREENSAVER_LOGO_W 220.0
+#define SCREENSAVER_LOGO_H 84.0
+
+static void screensaver_surface_free(ScreensaverSurface *surface) {
+    if (surface == NULL) {
+        return;
+    }
+    if (surface->window != NULL) {
+        gtk_window_destroy(GTK_WINDOW(surface->window));
+    }
+    g_free(surface);
+}
+
+static void screensaver_stop(NintyBar *bar) {
+    if (bar->screensaver_tick_source != 0) {
+        g_source_remove(bar->screensaver_tick_source);
+        bar->screensaver_tick_source = 0;
+    }
+    if (bar->screensaver_stop_source != 0) {
+        g_source_remove(bar->screensaver_stop_source);
+        bar->screensaver_stop_source = 0;
+    }
+    g_ptr_array_set_size(bar->screensaver_surfaces, 0);
+}
+
+static gboolean screensaver_stop_idle(gpointer user_data) {
+    NintyBar *bar = user_data;
+    bar->screensaver_stop_source = 0;
+    screensaver_stop(bar);
+    return G_SOURCE_REMOVE;
+}
+
+static void screensaver_dismiss(NintyBar *bar) {
+    if (bar->screensaver_surfaces->len == 0 ||
+        bar->screensaver_stop_source != 0) {
+        return;
+    }
+    bar->screensaver_stop_source =
+        g_idle_add(screensaver_stop_idle, bar);
+}
+
+static void screensaver_draw(GtkDrawingArea *area, cairo_t *cr, int width,
+                             int height, gpointer user_data) {
+    (void)area;
+    ScreensaverSurface *surface = user_data;
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    win98_fill(cr, 0, 0, width, height, win98_black);
+
+    double x = surface->x;
+    double y = surface->y;
+    win98_fill(cr, x, y, SCREENSAVER_LOGO_W, SCREENSAVER_LOGO_H,
+               win98_face);
+    win98_bevel(cr, x, y, SCREENSAVER_LOGO_W, SCREENSAVER_LOGO_H,
+                WIN98_BEVEL_RAISED);
+
+    cairo_save(cr);
+    cairo_translate(cr, x + 10.0, y + 16.0);
+    cairo_scale(cr, 3.0, 3.0);
+    win98_draw_start_flag(cr, 0, 0);
+    cairo_restore(cr);
+
+    cairo_save(cr);
+    cairo_translate(cr, x + 64.0, y + 24.0);
+    cairo_scale(cr, 2.0, 2.0);
+    win98_draw_text(cr, 0, 0, 76.0, 20.0, "Shindows",
+                    WIN98_ALIGN_LEFT, TRUE, win98_navy, FALSE);
+    cairo_restore(cr);
+}
+
+static gboolean screensaver_tick(gpointer user_data) {
+    NintyBar *bar = user_data;
+    for (guint i = 0; i < bar->screensaver_surfaces->len; i++) {
+        ScreensaverSurface *surface =
+            g_ptr_array_index(bar->screensaver_surfaces, i);
+        double max_x = MAX(0.0, surface->width - SCREENSAVER_LOGO_W);
+        double max_y = MAX(0.0, surface->height - SCREENSAVER_LOGO_H);
+        surface->x += surface->dx;
+        surface->y += surface->dy;
+        if (surface->x <= 0.0) {
+            surface->x = 0.0;
+            surface->dx = fabs(surface->dx);
+        } else if (surface->x >= max_x) {
+            surface->x = max_x;
+            surface->dx = -fabs(surface->dx);
+        }
+        if (surface->y <= 0.0) {
+            surface->y = 0.0;
+            surface->dy = fabs(surface->dy);
+        } else if (surface->y >= max_y) {
+            surface->y = max_y;
+            surface->dy = -fabs(surface->dy);
+        }
+        gtk_widget_queue_draw(surface->area);
+    }
+    return G_SOURCE_CONTINUE;
+}
+
+static gboolean screensaver_key(GtkEventControllerKey *controller,
+                                guint keyval, guint keycode,
+                                GdkModifierType state, gpointer user_data) {
+    (void)controller;
+    (void)keyval;
+    (void)keycode;
+    (void)state;
+    screensaver_dismiss(user_data);
+    return TRUE;
+}
+
+static void screensaver_click(GtkGestureClick *gesture, int n_press,
+                              double x, double y, gpointer user_data) {
+    (void)gesture;
+    (void)n_press;
+    (void)x;
+    (void)y;
+    ScreensaverSurface *surface = user_data;
+    screensaver_dismiss(surface->bar);
+}
+
+static void screensaver_motion(GtkEventControllerMotion *controller,
+                               double x, double y, gpointer user_data) {
+    (void)controller;
+    (void)x;
+    (void)y;
+    ScreensaverSurface *surface = user_data;
+    if (g_get_monotonic_time() - surface->bar->screensaver_activated_at <
+        400000) {
+        return;
+    }
+    screensaver_dismiss(surface->bar);
+}
+
+static void create_screensaver_surface(NintyBar *bar, GdkMonitor *monitor,
+                                       gboolean interactive) {
+    ScreensaverSurface *surface = g_new0(ScreensaverSurface, 1);
+    surface->bar = bar;
+
+    GdkRectangle geometry = { 0 };
+    if (monitor != NULL) {
+        gdk_monitor_get_geometry(monitor, &geometry);
+    }
+    surface->width = geometry.width > 0 ? geometry.width : 1;
+    surface->height = geometry.height > 0 ? geometry.height : 1;
+    surface->x = MAX(0.0, (surface->width - SCREENSAVER_LOGO_W) / 2.0);
+    surface->y = MAX(0.0, (surface->height - SCREENSAVER_LOGO_H) / 2.0);
+    surface->dx = 4.0;
+    surface->dy = 3.0;
+
+    GtkWidget *window = gtk_application_window_new(bar->app);
+    gtk_widget_add_css_class(window, "nintysh");
+    gtk_window_set_title(GTK_WINDOW(window), "nintysh-screensaver");
+    gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(window), surface->width,
+                                surface->height);
+
+    gtk_layer_init_for_window(GTK_WINDOW(window));
+    gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-screensaver");
+    gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_OVERLAY);
+    if (monitor != NULL) {
+        gtk_layer_set_monitor(GTK_WINDOW(window), monitor);
+    }
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                         TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
+                         TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
+                         TRUE);
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
+    gtk_layer_set_keyboard_mode(
+        GTK_WINDOW(window), interactive
+                                ? GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE
+                                : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+
+    surface->window = window;
+    surface->area = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(surface->area, TRUE);
+    gtk_widget_set_vexpand(surface->area, TRUE);
+    gtk_widget_set_focusable(surface->area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(surface->area),
+                                   screensaver_draw, surface, NULL);
+    gtk_window_set_child(GTK_WINDOW(window), surface->area);
+
+    GtkGesture *click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 1);
+    g_signal_connect(click, "pressed", G_CALLBACK(screensaver_click),
+                     surface);
+    gtk_widget_add_controller(surface->area,
+                              GTK_EVENT_CONTROLLER(click));
+
+    GtkEventController *motion = gtk_event_controller_motion_new();
+    g_signal_connect(motion, "motion", G_CALLBACK(screensaver_motion),
+                     surface);
+    gtk_widget_add_controller(surface->area, motion);
+
+    if (interactive) {
+        GtkEventController *keys = gtk_event_controller_key_new();
+        g_signal_connect(keys, "key-pressed", G_CALLBACK(screensaver_key),
+                         bar);
+        gtk_widget_add_controller(window, keys);
+    }
+
+    gtk_window_present(GTK_WINDOW(window));
+    g_ptr_array_add(bar->screensaver_surfaces, surface);
+}
+
+static void screensaver_start(NintyBar *bar) {
+    if (bar->screensaver_surfaces->len > 0) {
+        return;
+    }
+    close_menu(bar);
+    close_panel(bar);
+    bar->screensaver_activated_at = g_get_monotonic_time();
+
+    GListModel *monitors =
+        gdk_display_get_monitors(gdk_display_get_default());
+    guint count = monitors != NULL ? g_list_model_get_n_items(monitors) : 0;
+    if (count == 0) {
+        create_screensaver_surface(bar, NULL, TRUE);
+    } else {
+        for (guint i = 0; i < count; i++) {
+            GdkMonitor *monitor = g_list_model_get_item(monitors, i);
+            create_screensaver_surface(bar, monitor, i == 0);
+            g_object_unref(monitor);
+        }
+    }
+    bar->screensaver_tick_source =
+        g_timeout_add(33, screensaver_tick, bar);
 }
 
 static void draw_separator(cairo_t *cr, double x, double y, double h) {
@@ -7694,6 +8051,9 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
             ninty_lock_screen(bar);
         } else if (g_strcmp0(arg, "lock-external") == 0) {
             run_shell_command(NINTYSH_LOCK_COMMAND);
+        } else if (g_strcmp0(arg, "adhd") == 0 ||
+                   g_strcmp0(arg, "screensaver") == 0) {
+            screensaver_start(bar);
         } else if (g_strcmp0(arg, "suspend") == 0) {
             run_shell_command(NINTYSH_SUSPEND_COMMAND);
         } else if (g_strcmp0(arg, "lock-and-suspend") == 0) {
@@ -7962,6 +8322,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
         (GDestroyNotify)bar_surface_free);
     bar->lock_surfaces = g_ptr_array_new_with_free_func(
         (GDestroyNotify)lock_surface_free);
+    bar->screensaver_surfaces = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)screensaver_surface_free);
     bar->icon_cache = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
     bar->app_index = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
@@ -8105,6 +8467,8 @@ void ninty_bar_free(NintyBar *bar) {
     g_free(bar->menu_query);
     g_ptr_array_unref(bar->surfaces);
     g_ptr_array_unref(bar->lock_surfaces);
+    screensaver_stop(bar);
+    g_ptr_array_unref(bar->screensaver_surfaces);
     g_free(bar->lock_password);
     g_hash_table_destroy(bar->icon_cache);
     g_object_unref(bar->icon_theme);

@@ -40,6 +40,7 @@ let
       "#define NINTYSH_AUDIO_STEP ${toString settings.audio.step}"
       "#define NINTYSH_AUDIO_MAX_ROWS ${toString settings.audio.maxRows}"
       "#define NINTYSH_NOTIFICATION_MAX_ENTRIES ${toString settings.notifications.maxEntries}"
+      "#define NINTYSH_NOTIFICATION_DELETE_ON_READ ${if settings.notifications.deleteOnRead then "1" else "0"}"
       "#define NINTYSH_NOTIFICATION_TIMEOUT_MS ${toString settings.notifications.timeoutMs}"
       "#define NINTYSH_NOTIFICATION_ROW_HEIGHT ${toString settings.notifications.rowHeight}"
       "#define NINTYSH_NOTIFICATION_POPUP_WIDTH ${toString settings.notifications.popupWidth}"
@@ -280,6 +281,11 @@ in
               type = lib.types.ints.positive;
               default = 50;
               description = "Maximum notification history entries.";
+            };
+            deleteOnRead = lib.mkOption {
+              type = lib.types.bool;
+              default = false;
+              description = "Delete notifications when clicked in the notifications panel.";
             };
             timeoutMs = lib.mkOption {
               type = lib.types.ints.unsigned;

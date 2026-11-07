@@ -64,7 +64,8 @@ The shell is a layer-shell client. Start it inside a running niri session.
   selection, and default sink/source switching
 - Notification daemon (`org.freedesktop.Notifications`) with separate stacked
   popup cards, optional images (app icon, `image-path`, `image-data`), action
-  buttons, notification history, and a tray icon
+  buttons, notification history, and a tray icon; clicking history keeps
+  notifications by default (`notifications.deleteOnRead`)
 - MPRIS media panel with album art, progress/seek, play/pause, previous and
   next controls, player selection, plus tray and IPC control
 - Per-monitor display panel with brightness and color-temperature sliders;
@@ -78,6 +79,7 @@ The shell is a layer-shell client. Start it inside a running niri session.
 - Clipboard history panel with text and image entries, thumbnails, search,
   arrow-key navigation and click/Enter-to-copy; history persists across restarts
 - Built-in PAM lock screen covering every monitor
+- ADHD Mode screensaver from the session menu: bouncing Win98 logo, dismissed by any input
 - `control-center`/`settings-toggle` view with every panel shown at once
 - Session menu with lock, suspend, log out, reboot and shut down actions
 - Right-click task menu: focus, floating, fullscreen, close
@@ -291,6 +293,7 @@ Example `config.user.h`:
 #define NINTYSH_CLIPBOARD_IMAGE_MAX_BYTES (8 * 1024 * 1024)
 #define NINTYSH_AUDIO_STEP 5
 #define NINTYSH_NOTIFICATION_MAX_ENTRIES 50
+#define NINTYSH_NOTIFICATION_DELETE_ON_READ 0
 #define NINTYSH_NOTIFICATION_POPUP_WIDTH 380
 #define NINTYSH_NOTIFICATION_POPUP_MAX 3
 #define NINTYSH_NOTIFICATION_POPUP_MARGIN 12
@@ -363,6 +366,7 @@ Example:
       clipboard.imageMaxBytes = 8388608;
       audio.step = 5;
       notifications.maxEntries = 50;
+      notifications.deleteOnRead = false;
       notifications.timeoutMs = 6000;
       notifications.popupWidth = 380;
       notifications.popupMax = 3;
