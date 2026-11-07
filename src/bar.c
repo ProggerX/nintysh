@@ -1867,6 +1867,16 @@ static void clipboard_clear_history(NintyBar *bar) {
     gtk_widget_queue_draw(bar->panel_area);
 }
 
+static void clipboard_wipe(NintyBar *bar) {
+    clipboard_clear_history(bar);
+    g_free(bar->last_clipboard_hash);
+    bar->last_clipboard_hash = NULL;
+    char *output = NULL;
+    run_command_sync("wl-copy --clear", &output);
+    g_free(output);
+    osd_show_text(bar, "Clipboard wiped");
+}
+
 static gboolean run_command_sync_bytes(const char *command, GBytes **bytes) {
     gchar **argv = NULL;
     GError *error = NULL;
@@ -8213,7 +8223,13 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         command_wallpaper(bar, action, argument);
         g_free(argument);
     } else if (g_strcmp0(verb, "clipboard") == 0) {
-        open_panel(bar, PANEL_CLIPBOARD);
+        if (g_strcmp0(arg, "wipe") == 0) {
+            clipboard_wipe(bar);
+        } else if (g_strcmp0(arg, "clear") == 0) {
+            clipboard_clear_history(bar);
+        } else {
+            open_panel(bar, PANEL_CLIPBOARD);
+        }
     } else if (g_strcmp0(verb, "notifications-toggle") == 0 ||
                g_strcmp0(verb, "notification-toggle") == 0) {
         toggle_named_panel(bar, "notifications");
@@ -8278,6 +8294,8 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
     } else if (g_strcmp0(verb, "clipboard-copy") == 0) {
         const char *text = strchr(command, ' ');
         clipboard_copy_text(bar, text != NULL ? text + 1 : "");
+    } else if (g_strcmp0(verb, "clipboard-wipe") == 0) {
+        clipboard_wipe(bar);
     } else if (g_strcmp0(verb, "settings-open") == 0) {
         open_panel(bar, PANEL_CONTROL_CENTER);
     } else if (g_strcmp0(verb, "settings-close") == 0) {

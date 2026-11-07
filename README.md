@@ -262,7 +262,7 @@ nintysh msg screenshot-fullscreen
 Additional compatibility aliases include `settings-open`, `settings-close`,
 `session lock-and-suspend`, `volume-set`, `volume-osd`, `mic-volume-*`,
 `wifi-enable`, `wifi-disable`, `wifi-toggle`, `media play|pause|toggle|next|previous`,
-`clipboard-clear`, `clipboard-copy`, `notification-clear-active`,
+`clipboard-clear`, `clipboard-wipe`, `clipboard-copy`, `notification-clear-active`,
 `notification-clear-history`, and `osd-show`.
 
 Commands that print state to stdout, such as `volume-osd` returning values or
