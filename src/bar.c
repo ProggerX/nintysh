@@ -4535,34 +4535,37 @@ static void panel_draw_task_menu(cairo_t *cr, NintyBar *bar,
 static int control_center_layout(NintyBar *bar, double screen_w,
                                  double screen_h, PanelFrame *frames,
                                  PanelKind *kinds, int capacity) {
-    static const PanelKind columns[4][3] = {
-        { PANEL_POWER, PANEL_SESSION, PANEL_CALENDAR },
-        { PANEL_VOLUME, PANEL_NOTIFICATIONS, PANEL_NONE },
-        { PANEL_MEDIA, PANEL_CLIPBOARD, PANEL_NONE },
-        { PANEL_NETWORK, PANEL_DISPLAY, PANEL_WALLPAPER },
+    static const PanelKind order[] = {
+        PANEL_POWER,     PANEL_SESSION, PANEL_CALENDAR,
+        PANEL_VOLUME,    PANEL_NOTIFICATIONS, PANEL_MEDIA,
+        PANEL_CLIPBOARD, PANEL_NETWORK, PANEL_DISPLAY,
+        PANEL_WALLPAPER,
     };
 
     int count = 0;
     double column_x = 16.0;
-    for (int column = 0; column < 4; column++) {
-        double row_y = 16.0;
-        double column_w = 0.0;
-        for (int row = 0; row < 3; row++) {
-            PanelKind kind = columns[column][row];
-            if (kind == PANEL_NONE || count >= capacity) {
-                continue;
-            }
-            PanelFrame frame =
-                panel_frame_for(bar, kind, screen_w, screen_h);
-            frame.x = column_x;
-            frame.y = row_y;
-            frames[count] = frame;
-            kinds[count] = kind;
-            count++;
-            row_y += frame.h + 12.0;
-            column_w = MAX(column_w, frame.w);
+    double row_y = 16.0;
+    double column_w = 0.0;
+    double bottom_limit = screen_h - panel_bar_height() - 2.0;
+
+    for (guint i = 0; i < G_N_ELEMENTS(order) && count < capacity; i++) {
+        PanelKind kind = order[i];
+        PanelFrame frame =
+            panel_frame_for(bar, kind, screen_w, screen_h);
+
+        if (row_y > 16.0 && row_y + frame.h > bottom_limit) {
+            column_x += column_w + 16.0;
+            row_y = 16.0;
+            column_w = 0.0;
         }
-        column_x += column_w + 16.0;
+
+        frame.x = column_x;
+        frame.y = row_y;
+        frames[count] = frame;
+        kinds[count] = kind;
+        count++;
+        row_y += frame.h + 12.0;
+        column_w = MAX(column_w, frame.w);
     }
     return count;
 }
