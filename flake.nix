@@ -40,6 +40,7 @@
               slurp
               networkmanager
               pam
+              wayland
             ];
           };
 

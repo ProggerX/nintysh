@@ -3,11 +3,13 @@
 #include "auth.h"
 #include "config.h"
 #include "control.h"
+#include "gamma.h"
 #include "mpris.h"
 #include "niri.h"
 #include "win98.h"
 
 #include <gio/gio.h>
+#include <glib/gstdio.h>
 #include <gsk/gsk.h>
 #include <gtk4-layer-shell.h>
 #include <math.h>
@@ -50,6 +52,7 @@ typedef enum {
     HIT_NOTIFICATIONS,
     HIT_MEDIA,
     HIT_SESSION,
+    HIT_DISPLAY,
 } HitKind;
 
 typedef struct {
@@ -86,6 +89,7 @@ typedef enum {
     PANEL_NOTIFICATIONS,
     PANEL_MEDIA,
     PANEL_SESSION,
+    PANEL_DISPLAY,
 } PanelKind;
 
 typedef struct {
@@ -136,6 +140,12 @@ typedef struct {
     gboolean saved;
 } WifiNetwork;
 
+typedef enum {
+    OSD_KIND_NONE,
+    OSD_KIND_VOLUME,
+    OSD_KIND_BRIGHTNESS,
+} OsdKind;
+
 typedef struct {
     double x;
     double y;
@@ -176,6 +186,7 @@ struct NintyBar {
 
     NiriClient *niri;
     MprisClient *mpris;
+    GammaClient *gamma;
     char *media_art_source;
     GdkTexture *media_art;
     GPtrArray *apps;
@@ -197,6 +208,8 @@ struct NintyBar {
     GArray *clipboard_matches;
     char *clipboard_query;
     char *last_clipboard_hash;
+    char *state_dir;
+    guint clipboard_save_source;
     GPtrArray *audio_sinks;
     GPtrArray *audio_sources;
     GPtrArray *notifications;
@@ -245,6 +258,9 @@ struct NintyBar {
     gboolean volume_dragging;
     gboolean volume_drag_source;
     gboolean media_dragging;
+    gboolean display_dragging;
+    int display_drag_index;
+    int display_drag_kind;
     double volume_drag_x0;
     int panel_hover;
     int clipboard_scroll;
@@ -258,6 +274,7 @@ struct NintyBar {
     char osd_text[160];
     int osd_value;
     gboolean osd_mute;
+    OsdKind osd_kind;
 };
 
 static void close_menu(NintyBar *bar);
@@ -267,6 +284,7 @@ static void osd_show_volume(NintyBar *bar);
 static void osd_show_text(NintyBar *bar, const char *text);
 static void osd_show_text_timeout(NintyBar *bar, const char *text,
                                   guint timeout);
+static void osd_show_brightness(NintyBar *bar, int percent);
 static void notification_popup_update(NintyBar *bar);
 static void notification_popup_destroy(NintyBar *bar);
 static void notification_emit_closed(NintyBar *bar, guint id,
@@ -1573,6 +1591,159 @@ static void clipboard_update_matches(NintyBar *bar) {
     }
 }
 
+static void clipboard_save_state(NintyBar *bar) {
+    if (bar->state_dir == NULL) {
+        return;
+    }
+    char *dir = g_build_filename(bar->state_dir, "clipboard", NULL);
+    g_mkdir_with_parents(dir, 0700);
+    GString *index = g_string_new(NULL);
+    GHashTable *files = g_hash_table_new_full(g_str_hash, g_str_equal,
+                                               g_free, NULL);
+
+    for (guint i = 0; i < bar->clipboard_history->len; i++) {
+        ClipboardEntry *entry =
+            g_ptr_array_index(bar->clipboard_history, i);
+        if (entry->hash == NULL || entry->hash[0] == '\0') {
+            continue;
+        }
+        char *filename = g_strdup_printf("%s.data", entry->hash);
+        char *path = g_build_filename(dir, filename, NULL);
+        gboolean stored = FALSE;
+        if (entry->is_image && entry->data != NULL) {
+            gsize size = 0;
+            const void *data = g_bytes_get_data(entry->data, &size);
+            stored = g_file_set_contents(path, data, (gssize)size, NULL);
+        } else if (entry->text != NULL) {
+            stored = g_file_set_contents(path, entry->text,
+                                         (gssize)strlen(entry->text),
+                                         NULL);
+        }
+        g_free(path);
+        if (!stored) {
+            g_free(filename);
+            continue;
+        }
+
+        char *mime = g_base64_encode(
+            (const guchar *)(entry->mime != NULL ? entry->mime : ""),
+            strlen(entry->mime != NULL ? entry->mime : ""));
+        char *label = g_base64_encode(
+            (const guchar *)clipboard_entry_label(entry),
+            strlen(clipboard_entry_label(entry)));
+        g_string_append_printf(index, "%d\t%s\t%s\t%s\n",
+                               entry->is_image ? 1 : 0, mime,
+                               entry->hash, label);
+        g_free(mime);
+        g_free(label);
+        g_hash_table_add(files, filename);
+    }
+
+    char *index_path = g_build_filename(dir, "index", NULL);
+    g_file_set_contents(index_path, index->str, (gssize)index->len, NULL);
+    g_free(index_path);
+    g_string_free(index, TRUE);
+
+    GDir *scan = g_dir_open(dir, 0, NULL);
+    if (scan != NULL) {
+        const char *name = NULL;
+        while ((name = g_dir_read_name(scan)) != NULL) {
+            if (!g_str_has_suffix(name, ".data") ||
+                g_hash_table_contains(files, name)) {
+                continue;
+            }
+            char *path = g_build_filename(dir, name, NULL);
+            g_remove(path);
+            g_free(path);
+        }
+        g_dir_close(scan);
+    }
+    g_hash_table_unref(files);
+    g_free(dir);
+}
+
+static gboolean clipboard_save_cb(gpointer user_data) {
+    NintyBar *bar = user_data;
+    bar->clipboard_save_source = 0;
+    clipboard_save_state(bar);
+    return G_SOURCE_REMOVE;
+}
+
+static void clipboard_schedule_save(NintyBar *bar) {
+    if (bar->clipboard_save_source == 0) {
+        bar->clipboard_save_source =
+            g_timeout_add(250, clipboard_save_cb, bar);
+    }
+}
+
+static void clipboard_load_state(NintyBar *bar) {
+    if (bar->state_dir == NULL) {
+        return;
+    }
+    char *dir = g_build_filename(bar->state_dir, "clipboard", NULL);
+    char *index_path = g_build_filename(dir, "index", NULL);
+    char *contents = NULL;
+    gsize length = 0;
+    if (!g_file_get_contents(index_path, &contents, &length, NULL)) {
+        g_free(index_path);
+        g_free(dir);
+        return;
+    }
+    (void)length;
+
+    gchar **lines = g_strsplit(contents, "\n", -1);
+    for (int i = 0; lines[i] != NULL; i++) {
+        if ((int)bar->clipboard_history->len >=
+            NINTYSH_CLIPBOARD_MAX_ENTRIES) {
+            break;
+        }
+        if (lines[i][0] == '\0') {
+            continue;
+        }
+        gchar **fields = g_strsplit(lines[i], "\t", 4);
+        int field_count = g_strv_length(fields);
+        if (field_count >= 4 && fields[2][0] != '\0') {
+            gsize mime_len = 0;
+            gsize label_len = 0;
+            guchar *mime_raw = g_base64_decode(fields[1], &mime_len);
+            guchar *label_raw = g_base64_decode(fields[3], &label_len);
+            char *data_name =
+                g_strdup_printf("%s.data", fields[2]);
+            char *data_path = g_build_filename(dir, data_name, NULL);
+            g_free(data_name);
+            char *data = NULL;
+            gsize data_len = 0;
+            if (g_file_get_contents(data_path, &data, &data_len, NULL)) {
+                ClipboardEntry *entry = g_new0(ClipboardEntry, 1);
+                entry->is_image = atoi(fields[0]) != 0;
+                entry->mime = g_strndup((char *)mime_raw, mime_len);
+                entry->label = g_strndup((char *)label_raw, label_len);
+                entry->hash = g_strdup(fields[2]);
+                if (entry->is_image) {
+                    entry->data = g_bytes_new_take(data, data_len);
+                    GError *error = NULL;
+                    entry->texture = gdk_texture_new_from_bytes(
+                        entry->data, &error);
+                    g_clear_error(&error);
+                } else {
+                    entry->text = g_strndup(data, data_len);
+                    g_free(data);
+                }
+                g_ptr_array_add(bar->clipboard_history, entry);
+            }
+            g_free(data_path);
+            g_free(mime_raw);
+            g_free(label_raw);
+        }
+        g_strfreev(fields);
+    }
+    g_strfreev(lines);
+    g_free(contents);
+    g_free(index_path);
+    g_free(dir);
+    clipboard_update_matches(bar);
+}
+
 static void clipboard_trim(NintyBar *bar) {
     while (bar->clipboard_history->len > NINTYSH_CLIPBOARD_MAX_ENTRIES) {
         g_ptr_array_remove_index(
@@ -1593,6 +1764,7 @@ static void clipboard_add_entry(NintyBar *bar, ClipboardEntry *entry) {
     g_ptr_array_insert(bar->clipboard_history, 0, entry);
     clipboard_trim(bar);
     clipboard_update_matches(bar);
+    clipboard_schedule_save(bar);
     gtk_widget_queue_draw(bar->panel_area);
 }
 
@@ -1651,6 +1823,7 @@ static void clipboard_clear_history(NintyBar *bar) {
     g_array_set_size(bar->clipboard_matches, 0);
     bar->clipboard_scroll = 0;
     bar->clipboard_selected = -1;
+    clipboard_schedule_save(bar);
     gtk_widget_queue_draw(bar->panel_area);
 }
 
@@ -2825,6 +2998,12 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
         frame.w = 188.0;
         frame.h = 152.0;
         break;
+    case PANEL_DISPLAY: {
+        int outputs = MAX(1, (int)gamma_client_output_count(bar->gamma));
+        frame.w = 360.0;
+        frame.h = 34.0 + outputs * 92.0;
+        break;
+    }
     default:
         frame.w = 1.0;
         frame.h = 1.0;
@@ -3914,6 +4093,96 @@ static void panel_draw_media(cairo_t *cr, NintyBar *bar,
     }
 }
 
+#define DISPLAY_CARD_HEIGHT 92.0
+
+static double display_card_y(const PanelFrame *frame, guint index) {
+    return frame->y + frame->title_h + 8.0 +
+           index * DISPLAY_CARD_HEIGHT;
+}
+
+static double display_brightness_y(const PanelFrame *frame,
+                                   guint index) {
+    return display_card_y(frame, index) + 38.0;
+}
+
+static double display_temperature_y(const PanelFrame *frame,
+                                    guint index) {
+    return display_card_y(frame, index) + 70.0;
+}
+
+static int display_index_at(NintyBar *bar, const PanelFrame *frame,
+                            double y) {
+    double start = frame->y + frame->title_h + 8.0;
+    if (y < start) {
+        return -1;
+    }
+    int index = (int)((y - start) / DISPLAY_CARD_HEIGHT);
+    int count = (int)gamma_client_output_count(bar->gamma);
+    return index >= 0 && index < count ? index : -1;
+}
+
+static void display_draw_slider(cairo_t *cr, const PanelFrame *frame,
+                                double y, double fraction) {
+    double x = frame->x + 16.0;
+    double w = frame->w - 32.0;
+    double h = 8.0;
+    win98_fill(cr, x, y, w, h, win98_light);
+    win98_bevel(cr, x, y, w, h, WIN98_BEVEL_SUNKEN);
+
+    double filled = (w - 4.0) * CLAMP(fraction, 0.0, 1.0);
+    if (filled > 0.0) {
+        win98_fill(cr, x + 2.0, y + 2.0, filled, h - 4.0,
+                   win98_navy);
+    }
+    double thumb = x + 2.0 + filled;
+    win98_fill(cr, thumb - 3.0, y - 2.0, 7.0, h + 4.0, win98_face);
+    win98_bevel(cr, thumb - 3.0, y - 2.0, 7.0, h + 4.0,
+                WIN98_BEVEL_RAISED);
+}
+
+static void panel_draw_display(cairo_t *cr, NintyBar *bar,
+                               const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Display");
+
+    int count = (int)gamma_client_output_count(bar->gamma);
+    if (count == 0) {
+        win98_draw_text(cr, frame->x + 16.0, frame->y + 40.0,
+                        frame->w - 32.0, 20.0,
+                        "No gamma-capable outputs", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+        return;
+    }
+
+    for (int i = 0; i < count; i++) {
+        double y = display_card_y(frame, (guint)i);
+        int brightness = gamma_client_brightness(bar->gamma, (guint)i);
+        int temperature = gamma_client_temperature(bar->gamma, (guint)i);
+
+        win98_draw_text(cr, frame->x + 16.0, y, frame->w - 32.0, 18.0,
+                        gamma_client_output_name(bar->gamma, (guint)i),
+                        WIN98_ALIGN_LEFT, TRUE, win98_text, TRUE);
+
+        char brightness_text[64];
+        g_snprintf(brightness_text, sizeof(brightness_text),
+                   "Brightness %d%%", brightness);
+        win98_draw_text(cr, frame->x + 16.0, y + 20.0,
+                        frame->w - 32.0, 16.0, brightness_text,
+                        WIN98_ALIGN_LEFT, FALSE, win98_text, FALSE);
+        display_draw_slider(cr, frame, display_brightness_y(frame, (guint)i),
+                            brightness / 100.0);
+
+        char temperature_text[64];
+        g_snprintf(temperature_text, sizeof(temperature_text),
+                   "Temperature %dK", temperature);
+        win98_draw_text(cr, frame->x + 16.0, y + 52.0,
+                        frame->w - 32.0, 16.0, temperature_text,
+                        WIN98_ALIGN_LEFT, FALSE, win98_text, FALSE);
+        display_draw_slider(cr, frame,
+                            display_temperature_y(frame, (guint)i),
+                            (temperature - 1000) / 9000.0);
+    }
+}
+
 static const char *session_menu_items[] = {
     "Lock", "Suspend", "Log Out", NULL, "Reboot", "Shut Down"
 };
@@ -4084,6 +4353,9 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     case PANEL_SESSION:
         panel_draw_session(cr, bar, &frame);
         break;
+    case PANEL_DISPLAY:
+        panel_draw_display(cr, bar, &frame);
+        break;
     default:
         break;
     }
@@ -4160,6 +4432,7 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     bar->panel_hover = -1;
     bar->volume_dragging = FALSE;
     bar->media_dragging = FALSE;
+    bar->display_dragging = FALSE;
     gtk_widget_set_visible(bar->panel_window, TRUE);
     gtk_window_present(GTK_WINDOW(bar->panel_window));
     gtk_widget_grab_focus(bar->panel_area);
@@ -4190,6 +4463,7 @@ static void close_panel(NintyBar *bar) {
     bar->panel_kind = PANEL_NONE;
     bar->volume_dragging = FALSE;
     bar->media_dragging = FALSE;
+    bar->display_dragging = FALSE;
     bar->network_password_mode = FALSE;
     g_free(bar->network_password_ssid);
     g_free(bar->network_password);
@@ -4255,6 +4529,33 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         if (row >= 0) {
             session_menu_activate(bar, row);
             close_panel(bar);
+        }
+        return;
+    }
+
+    if (bar->panel_kind == PANEL_DISPLAY) {
+        int index = display_index_at(bar, &frame, y);
+        if (index >= 0 && x >= frame.x + 10.0 &&
+            x < frame.x + frame.w - 10.0) {
+            double fraction = CLAMP(
+                (x - (frame.x + 18.0)) / (frame.w - 36.0), 0.0, 1.0);
+            double brightness_y =
+                display_brightness_y(&frame, (guint)index);
+            double temperature_y =
+                display_temperature_y(&frame, (guint)index);
+            if (y >= brightness_y - 10.0 && y < brightness_y + 18.0) {
+                int percent = (int)round(fraction * 100.0);
+                gamma_client_set_brightness(bar->gamma, (guint)index,
+                                            percent);
+                osd_show_brightness(bar, percent);
+            } else if (y >= temperature_y - 10.0 &&
+                       y < temperature_y + 18.0) {
+                gamma_client_set_temperature(
+                    bar->gamma, (guint)index,
+                    (int)round(1000.0 + fraction * 9000.0));
+            }
+            gtk_widget_queue_draw(bar->panel_area);
+            return;
         }
         return;
     }
@@ -4548,6 +4849,33 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
         return;
     }
 
+    if (bar->panel_kind == PANEL_DISPLAY) {
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_DISPLAY, width, height);
+        int index = display_index_at(bar, &frame, start_y);
+        if (index < 0) {
+            return;
+        }
+        double brightness_y =
+            display_brightness_y(&frame, (guint)index);
+        double temperature_y =
+            display_temperature_y(&frame, (guint)index);
+        if (start_y >= brightness_y - 10.0 &&
+            start_y < brightness_y + 18.0) {
+            bar->display_dragging = TRUE;
+            bar->display_drag_index = index;
+            bar->display_drag_kind = 0;
+            bar->volume_drag_x0 = start_x;
+        } else if (start_y >= temperature_y - 10.0 &&
+                   start_y < temperature_y + 18.0) {
+            bar->display_dragging = TRUE;
+            bar->display_drag_index = index;
+            bar->display_drag_kind = 1;
+            bar->volume_drag_x0 = start_x;
+        }
+        return;
+    }
+
     if (bar->panel_kind != PANEL_VOLUME) {
         return;
     }
@@ -4610,6 +4938,26 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
         return;
     }
 
+    if (bar->display_dragging) {
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_DISPLAY, width, height);
+        double fraction = CLAMP(
+            (bar->volume_drag_x0 + offset_x - (frame.x + 18.0)) /
+                (frame.w - 36.0),
+            0.0, 1.0);
+        if (bar->display_drag_kind == 0) {
+            gamma_client_set_brightness(
+                bar->gamma, (guint)bar->display_drag_index,
+                (int)round(fraction * 100.0));
+        } else {
+            gamma_client_set_temperature(
+                bar->gamma, (guint)bar->display_drag_index,
+                (int)round(1000.0 + fraction * 9000.0));
+        }
+        gtk_widget_queue_draw(bar->panel_area);
+        return;
+    }
+
     if (!bar->volume_dragging) {
         return;
     }
@@ -4630,6 +4978,11 @@ static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
     (void)offset_x;
     (void)offset_y;
     NintyBar *bar = user_data;
+    if (bar->display_dragging) {
+        bar->display_dragging = FALSE;
+        gtk_widget_queue_draw(bar->panel_area);
+        return;
+    }
     if (bar->media_dragging) {
         bar->media_dragging = FALSE;
         mpris_client_poll(bar->mpris);
@@ -4933,6 +5286,41 @@ static void osd_show_volume(NintyBar *bar) {
     }
     bar->osd_value = bar->volume_percent;
     bar->osd_mute = bar->volume_muted;
+    bar->osd_kind = OSD_KIND_VOLUME;
+    osd_present(bar);
+}
+
+static void brightness_osd_from_backlight(NintyBar *bar) {
+    char *output = NULL;
+    if (!run_command_sync("brightnessctl -m", &output)) {
+        g_free(output);
+        return;
+    }
+    gchar **fields = g_strsplit(output, ",", -1);
+    for (int i = 0; fields[i] != NULL; i++) {
+        if (strchr(fields[i], '%') != NULL) {
+            osd_show_brightness(bar, atoi(fields[i]));
+            break;
+        }
+    }
+    g_strfreev(fields);
+    g_free(output);
+}
+
+static void brightness_run(NintyBar *bar, const char *command) {
+    char *output = NULL;
+    run_command_sync(command, &output);
+    g_free(output);
+    brightness_osd_from_backlight(bar);
+}
+
+static void osd_show_brightness(NintyBar *bar, int percent) {
+    percent = CLAMP(percent, 0, 100);
+    g_snprintf(bar->osd_text, sizeof(bar->osd_text), "Brightness %d%%",
+               percent);
+    bar->osd_value = percent;
+    bar->osd_mute = FALSE;
+    bar->osd_kind = OSD_KIND_BRIGHTNESS;
     osd_present(bar);
 }
 
@@ -4942,6 +5330,7 @@ static void osd_show_text_timeout(NintyBar *bar, const char *text,
               sizeof(bar->osd_text));
     bar->osd_value = -1;
     bar->osd_mute = FALSE;
+    bar->osd_kind = OSD_KIND_NONE;
     osd_present_timeout(bar, timeout);
 }
 
@@ -4969,7 +5358,11 @@ static void osd_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     win98_bevel(cr, 0, 0, width, height, WIN98_BEVEL_RAISED);
 
     if (bar->osd_value >= 0) {
-        win98_draw_volume_icon(cr, 10, 10, bar->osd_mute);
+        if (bar->osd_kind == OSD_KIND_BRIGHTNESS) {
+            win98_draw_display_icon(cr, 10, 10);
+        } else {
+            win98_draw_volume_icon(cr, 10, 10, bar->osd_mute);
+        }
         win98_draw_text(cr, 34, 8, width - 44, 18, bar->osd_text,
                         WIN98_ALIGN_LEFT, TRUE, win98_text, TRUE);
         win98_fill(cr, 34, 32, width - 46, 12, win98_light);
@@ -4987,7 +5380,7 @@ static void osd_draw(GtkDrawingArea *area, cairo_t *cr, int width,
 static void lock_panel_rect(int width, int height, double *x, double *y,
                             double *w, double *h) {
     *w = 360.0;
-    *h = 240.0;
+    *h = 192.0;
     *x = (width - *w) / 2.0;
     *y = (height - *h) / 2.0;
 }
@@ -5081,7 +5474,7 @@ static void lock_surface_draw(GtkDrawingArea *area, cairo_t *cr, int width,
                                              : win98_text,
                     FALSE);
 
-    win98_draw_text(cr, x + 16.0, y + 172.0, w - 32.0, 18.0,
+    win98_draw_text(cr, x + 16.0, y + 166.0, w - 32.0, 18.0,
                     bar->lock_message, WIN98_ALIGN_CENTER, FALSE,
                     win98_text, TRUE);
 }
@@ -5457,13 +5850,14 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
                        ? MAX(20, win98_text_width(layout_name, TRUE) + 8)
                        : 0;
     double tray_w = 4.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 +
-                    (bar->battery_available ? 20.0 : 0.0) + layout_w + 4.0 +
-                    clock_w + 4.0;
+                    20.0 + (bar->battery_available ? 20.0 : 0.0) +
+                    layout_w + 4.0 + clock_w + 4.0;
     double tray_x = w - 2.0 - tray_w;
     if (tray_x < x + 40.0) {
         tray_x = x + 40.0;
     }
 
+    if (NINTYSH_TASKBAR_APPS) {
     guint window_count = niri_client_window_count(bar->niri);
     guint visible_windows = 0;
     for (guint i = 0; i < window_count; i++) {
@@ -5548,6 +5942,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
         g_free(widths);
         g_free(windows);
     }
+    }
 
     win98_fill(cr, tray_x, y, tray_w, button_h, win98_face);
     win98_bevel(cr, tray_x, y, tray_w, button_h, WIN98_BEVEL_SUNKEN);
@@ -5588,8 +5983,8 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     bar_add_hit(bar, HIT_MEDIA, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
-    win98_draw_session_icon(cr, icon_x, icon_y);
-    bar_add_hit(bar, HIT_SESSION, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
+    win98_draw_display_icon(cr, icon_x, icon_y);
+    bar_add_hit(bar, HIT_DISPLAY, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
     if (layout_w > 0) {
@@ -5599,13 +5994,17 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
         icon_x += layout_w;
     }
 
-    double clock_x = tray_x + tray_w - clock_w - 2.0;
+    double session_x = tray_x + tray_w - 18.0;
+    double clock_x = session_x - clock_w - 4.0;
     if (clock_x > icon_x) {
         draw_separator(cr, clock_x - 3.0, y + 4.0, button_h - 8.0);
     }
     win98_draw_text(cr, clock_x, y + 2.0, clock_w, button_h - 4.0, clock_text,
                WIN98_ALIGN_RIGHT, FALSE, win98_text, FALSE);
     bar_add_hit(bar, HIT_CLOCK, clock_x, y, clock_w, button_h, 0);
+
+    win98_draw_session_icon(cr, session_x, icon_y);
+    bar_add_hit(bar, HIT_SESSION, session_x - 1.0, icon_y, 18.0, 16.0, 0);
 }
 
 static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
@@ -5661,6 +6060,9 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     case HIT_SESSION:
         open_panel(bar, PANEL_SESSION);
         break;
+    case HIT_DISPLAY:
+        open_panel(bar, PANEL_DISPLAY);
+        break;
     default:
         break;
     }
@@ -5694,7 +6096,8 @@ static gboolean bar_tick(gpointer user_data) {
     mpris_client_poll(bar->mpris);
     update_media_art(bar);
     bar_queue_redraw(bar);
-    if (bar->panel_kind == PANEL_MEDIA) {
+    if (bar->panel_kind == PANEL_MEDIA ||
+        bar->panel_kind == PANEL_DISPLAY) {
         gtk_widget_queue_draw(bar->panel_area);
     }
     return G_SOURCE_CONTINUE;
@@ -6344,6 +6747,11 @@ static PanelKind panel_kind_from_name(const char *name) {
         g_strcmp0(name, "power-menu") == 0) {
         return PANEL_SESSION;
     }
+    if (g_strcmp0(name, "display") == 0 ||
+        g_strcmp0(name, "brightness") == 0 ||
+        g_strcmp0(name, "temperature") == 0) {
+        return PANEL_DISPLAY;
+    }
     return PANEL_NONE;
 }
 
@@ -6799,7 +7207,8 @@ static void command_media(NintyBar *bar, gchar **parts, int count) {
     mpris_client_poll(bar->mpris);
     update_media_art(bar);
     bar_queue_redraw(bar);
-    if (bar->panel_kind == PANEL_MEDIA) {
+    if (bar->panel_kind == PANEL_MEDIA ||
+        bar->panel_kind == PANEL_DISPLAY) {
         gtk_widget_queue_draw(bar->panel_area);
     }
 }
@@ -6864,9 +7273,9 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         }
     } else if (g_strcmp0(verb, "brightness") == 0) {
         if (arg == NULL || g_strcmp0(arg, "up") == 0) {
-            run_shell_command(NINTYSH_BRIGHTNESS_UP_COMMAND);
+            brightness_run(bar, NINTYSH_BRIGHTNESS_UP_COMMAND);
         } else if (g_strcmp0(arg, "down") == 0) {
-            run_shell_command(NINTYSH_BRIGHTNESS_DOWN_COMMAND);
+            brightness_run(bar, NINTYSH_BRIGHTNESS_DOWN_COMMAND);
         }
     } else if (g_strcmp0(verb, "screenshot") == 0) {
         if (arg == NULL || g_strcmp0(arg, "region") == 0) {
@@ -7051,9 +7460,9 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
                g_strcmp0(verb, "lock") == 0) {
         ninty_lock_screen(bar);
     } else if (g_strcmp0(verb, "brightness-up") == 0) {
-        run_shell_command(NINTYSH_BRIGHTNESS_UP_COMMAND);
+        brightness_run(bar, NINTYSH_BRIGHTNESS_UP_COMMAND);
     } else if (g_strcmp0(verb, "brightness-down") == 0) {
-        run_shell_command(NINTYSH_BRIGHTNESS_DOWN_COMMAND);
+        brightness_run(bar, NINTYSH_BRIGHTNESS_DOWN_COMMAND);
     } else if (g_strcmp0(verb, "screenshot-region") == 0) {
         run_shell_command(NINTYSH_SCREENSHOT_REGION_COMMAND);
     } else if (g_strcmp0(verb, "screenshot-fullscreen") == 0) {
@@ -7101,6 +7510,9 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     gtk_icon_theme_set_theme_name(bar->icon_theme, "hicolor");
     bar->menu_hover = -1;
     bar->panel_hover = -1;
+    bar->state_dir =
+        g_build_filename(g_get_user_state_dir(), "nintysh", NULL);
+    clipboard_load_state(bar);
 
     load_css();
     load_apps(bar);
@@ -7134,6 +7546,7 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->niri = niri_client_new(niri_changed_cb, bar);
     bar->mpris = mpris_client_new(NULL, bar);
     mpris_client_poll(bar->mpris);
+    bar->gamma = gamma_client_new();
     update_media_art(bar);
 
     update_volume(bar);
@@ -7191,6 +7604,9 @@ void ninty_bar_free(NintyBar *bar) {
     if (bar->mpris != NULL) {
         mpris_client_free(bar->mpris);
     }
+    if (bar->gamma != NULL) {
+        gamma_client_free(bar->gamma);
+    }
     if (bar->media_art != NULL) {
         g_object_unref(bar->media_art);
     }
@@ -7200,9 +7616,15 @@ void ninty_bar_free(NintyBar *bar) {
     g_hash_table_destroy(bar->app_index);
     g_ptr_array_unref(bar->apps);
     g_ptr_array_unref(bar->menu_results);
+    if (bar->clipboard_save_source != 0) {
+        g_source_remove(bar->clipboard_save_source);
+        bar->clipboard_save_source = 0;
+        clipboard_save_state(bar);
+    }
     g_ptr_array_unref(bar->clipboard_history);
     g_array_unref(bar->clipboard_matches);
     g_free(bar->clipboard_query);
+    g_free(bar->state_dir);
     g_ptr_array_unref(bar->audio_sinks);
     g_ptr_array_unref(bar->audio_sources);
     g_ptr_array_unref(bar->notifications);

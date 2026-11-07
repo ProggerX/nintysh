@@ -349,9 +349,6 @@ void win98_draw_media_icon(cairo_t *cr, double x, double y,
     cairo_save(cr);
     cairo_translate(cr, x, y);
 
-    win98_fill(cr, 1, 1, 14, 14, win98_face);
-    win98_bevel(cr, 1, 1, 14, 14, WIN98_BEVEL_RAISED);
-
     cairo_set_source_rgb(cr, win98_black.r, win98_black.g, win98_black.b);
     cairo_set_line_width(cr, 1.0);
     cairo_arc(cr, 5.0, 12.0, 2.4, 0, 2 * M_PI);
@@ -382,6 +379,34 @@ void win98_draw_session_icon(cairo_t *cr, double x, double y) {
     cairo_stroke(cr);
 
     win98_fill(cr, 7, 3, 2, 6, win98_red);
+
+    cairo_restore(cr);
+}
+
+void win98_draw_display_icon(cairo_t *cr, double x, double y) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    cairo_set_source_rgb(cr, win98_yellow.r, win98_yellow.g,
+                         win98_yellow.b);
+    cairo_arc(cr, 8.0, 8.0, 3.5, 0, 2 * M_PI);
+    cairo_fill_preserve(cr);
+
+    cairo_set_source_rgb(cr, win98_black.r, win98_black.g,
+                         win98_black.b);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    for (int i = 0; i < 8; i++) {
+        double angle = i * M_PI / 4.0;
+        double inner = 5.0;
+        double outer = 7.0;
+        cairo_move_to(cr, 8.0 + cos(angle) * inner,
+                      8.0 + sin(angle) * inner);
+        cairo_line_to(cr, 8.0 + cos(angle) * outer,
+                      8.0 + sin(angle) * outer);
+    }
+    cairo_stroke(cr);
 
     cairo_restore(cr);
 }

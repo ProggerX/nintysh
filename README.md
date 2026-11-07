@@ -67,18 +67,22 @@ The shell is a layer-shell client. Start it inside a running niri session.
   buttons, notification history, and a tray icon
 - MPRIS media panel with album art, progress/seek, play/pause, previous and
   next controls, player selection, plus tray and IPC control
+- Per-monitor display panel with brightness and color-temperature sliders;
+  internal panels use hardware backlight control, temperature and external
+  outputs use wlr-gamma-control, and values are persisted per output
 - Calendar panel
 - NetworkManager network panel with Wi-Fi toggle, scanning, active connection
   info, signal/security list, saved/open connections and a password prompt for
   new secured networks
 - Battery information panel
 - Clipboard history panel with text and image entries, thumbnails, search,
-  arrow-key navigation and click/Enter-to-copy
+  arrow-key navigation and click/Enter-to-copy; history persists across restarts
 - Built-in PAM lock screen covering every monitor
 - Session menu with lock, suspend, log out, reboot and shut down actions
 - Right-click task menu: focus, floating, fullscreen, close
 - Per-monitor taskbars
 - Multi-monitor window/workspace filtering
+- Optional taskbar application buttons (`bar.showApps`)
 - Clock, audio, network, battery, notification and keyboard-layout indicators
 
 ### CLI control
@@ -106,8 +110,8 @@ nintysh msg panel toggle clipboard
 nintysh msg panel toggle notifications
 ```
 
-Panel names: `launcher`, `audio`, `media`, `clipboard`, `calendar`,
-`network`, `power`, `notifications`, `session`.
+Panel names: `launcher`, `audio`, `media`, `display`, `clipboard`,
+`calendar`, `network`, `power`, `notifications`, `session`.
 
 Audio output and microphone:
 
@@ -259,6 +263,7 @@ Example `config.user.h`:
 #define NINTYSH_BAR_HEIGHT 30
 #define NINTYSH_BAR_SCALE 1.0
 #define NINTYSH_PANEL_SCALE 1.0
+#define NINTYSH_TASKBAR_APPS 1
 #define NINTYSH_FONT_FAMILY "Tahoma"
 #define NINTYSH_FONT_PX 12
 #define NINTYSH_COLOR_FACE 0xC0C0C0
@@ -330,6 +335,7 @@ Example:
     settings = {
       bar.height = 30;
       bar.scale = 1.0;
+      bar.showApps = true;
       panels.scale = 1.0;
       font.size = 12;
       launcher.width = 280;
@@ -361,12 +367,13 @@ The module installs the package and, with `autostart`, creates a systemd user se
 
 - niri only; the Sway backend was not kept
 - taskbars are created for every monitor, but menus, panels and OSD still open on the primary monitor
-- clipboard and notification history are in-memory and limited by compile-time config
+- notification history is in-memory and limited by compile-time config; clipboard history is persisted
 - no StatusNotifier tray support
 - notification inline replies and notification sound hints are not implemented
 - notification `image-data` rendering is best-effort for 8-bit RGB/RGBA
 - window icon matching is heuristic
 - media control depends on MPRIS; remote album-art URLs are not downloaded
+- external display brightness uses gamma dimming; DDC/CI is not implemented
 - audio control and default-device switching depend on `wpctl`/PipeWire
 - the Wi-Fi panel uses `nmcli`; new secured networks prompt for a password
 - `settings-toggle` opens the audio panel; there is no separate settings UI

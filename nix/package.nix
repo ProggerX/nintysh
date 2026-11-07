@@ -13,6 +13,7 @@
   slurp,
   networkmanager,
   pam,
+  wayland,
   extraConfig ? "",
   wrapperArgs ? [ ],
 }:
@@ -39,6 +40,7 @@ stdenv.mkDerivation {
     gtk4-layer-shell
     json-glib
     pam
+    wayland
   ];
 
   postPatch = lib.optionalString (extraConfig != "") ''

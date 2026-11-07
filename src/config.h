@@ -19,6 +19,9 @@
 #ifndef NINTYSH_PANEL_SCALE
 #define NINTYSH_PANEL_SCALE 1.0
 #endif
+#ifndef NINTYSH_TASKBAR_APPS
+#define NINTYSH_TASKBAR_APPS 1
+#endif
 #ifndef NINTYSH_BUTTON_Y
 #define NINTYSH_BUTTON_Y 3.0
 #endif

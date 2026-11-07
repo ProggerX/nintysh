@@ -16,6 +16,7 @@ let
       "#define NINTYSH_FONT_PX ${toString settings.font.size}"
       "#define NINTYSH_BAR_HEIGHT ${toString settings.bar.height}"
       "#define NINTYSH_BAR_SCALE ${toString settings.bar.scale}"
+      "#define NINTYSH_TASKBAR_APPS ${if settings.bar.showApps then "1" else "0"}"
       "#define NINTYSH_PANEL_SCALE ${toString settings.panels.scale}"
       "#define NINTYSH_BUTTON_Y ${toString settings.bar.buttonY}"
       "#define NINTYSH_BUTTON_HEIGHT ${toString settings.bar.buttonHeight}"
@@ -87,7 +88,7 @@ in
 
     autostart = lib.mkOption {
       type = lib.types.bool;
-      default = true;
+      default = false;
       description = "Start nintysh with the graphical session.";
     };
 
@@ -129,6 +130,11 @@ in
               type = lib.types.number;
               default = 1.0;
               description = "Taskbar scaling factor.";
+            };
+            showApps = lib.mkOption {
+              type = lib.types.bool;
+              default = true;
+              description = "Show running application buttons in the taskbar.";
             };
             buttonY = lib.mkOption {
               type = lib.types.number;

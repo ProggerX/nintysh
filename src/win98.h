@@ -55,5 +55,6 @@ void win98_draw_notification_icon(cairo_t *cr, double x, double y,
 void win98_draw_media_icon(cairo_t *cr, double x, double y,
                            gboolean playing);
 void win98_draw_session_icon(cairo_t *cr, double x, double y);
+void win98_draw_display_icon(cairo_t *cr, double x, double y);
 
 #endif
