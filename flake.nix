@@ -41,6 +41,7 @@
               networkmanager
               pam
               wayland
+              gdk-pixbuf
             ];
           };
 

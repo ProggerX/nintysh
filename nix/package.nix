@@ -14,6 +14,7 @@
   networkmanager,
   pam,
   wayland,
+  gdk-pixbuf,
   extraConfig ? "",
   wrapperArgs ? [ ],
 }:
@@ -41,6 +42,7 @@ stdenv.mkDerivation {
     json-glib
     pam
     wayland
+    gdk-pixbuf
   ];
 
   postPatch = lib.optionalString (extraConfig != "") ''

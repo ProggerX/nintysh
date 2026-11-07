@@ -117,6 +117,9 @@
 #define NINTYSH_NOTIFICATION_POPUP_MARGIN 12
 #endif
 
+#ifndef NINTYSH_WALLPAPER_DIR
+#define NINTYSH_WALLPAPER_DIR "~/walls"
+#endif
 #ifndef NINTYSH_PAM_SERVICE
 #define NINTYSH_PAM_SERVICE "login"
 #endif

@@ -411,6 +411,23 @@ void win98_draw_display_icon(cairo_t *cr, double x, double y) {
     cairo_restore(cr);
 }
 
+void win98_draw_wallpaper_icon(cairo_t *cr, double x, double y) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    win98_fill(cr, 1, 3, 14, 10, win98_blue);
+    win98_bevel(cr, 1, 3, 14, 10, WIN98_BEVEL_SUNKEN);
+    win98_fill(cr, 3, 4, 10, 6, win98_white);
+    win98_fill(cr, 3, 8, 10, 2, win98_green);
+
+    cairo_set_source_rgb(cr, win98_yellow.r, win98_yellow.g,
+                         win98_yellow.b);
+    cairo_arc(cr, 11.0, 6.0, 1.5, 0, 2 * M_PI);
+    cairo_fill(cr);
+
+    cairo_restore(cr);
+}
+
 void win98_draw_notification_icon(cairo_t *cr, double x, double y,
                                   gboolean active) {
     cairo_save(cr);

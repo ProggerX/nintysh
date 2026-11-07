@@ -1,7 +1,7 @@
 build_dir := "build"
 bin := "nintysh"
 cc := env_var_or_default("CC", "cc")
-pkg_deps := "gtk4 gtk4-layer-shell-0 json-glib-1.0 wayland-client"
+pkg_deps := "gtk4 gtk4-layer-shell-0 json-glib-1.0 gdk-pixbuf-2.0 wayland-client"
 pam_cflags := env_var_or_default("NINTYSH_PAM_CFLAGS", "")
 pam_libs := env_var_or_default("NINTYSH_PAM_LIBS", "-lpam")
 
@@ -9,7 +9,7 @@ default: build
 
 build:
     mkdir -p {{build_dir}}
-    {{cc}} -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra {{pam_cflags}} $(pkg-config --cflags {{pkg_deps}}) src/main.c src/win98.c src/niri.c src/mpris.c src/auth.c src/gamma.c src/gamma-protocol.c src/bar.c src/control.c -o {{build_dir}}/{{bin}} $(pkg-config --libs {{pkg_deps}}) {{pam_libs}} -lm
+    {{cc}} -std=c11 -D_GNU_SOURCE -O2 -g -Wall -Wextra {{pam_cflags}} $(pkg-config --cflags {{pkg_deps}}) src/main.c src/win98.c src/niri.c src/mpris.c src/auth.c src/gamma.c src/gamma-protocol.c src/wallpaper.c src/bar.c src/control.c -o {{build_dir}}/{{bin}} $(pkg-config --libs {{pkg_deps}}) {{pam_libs}} -lm
 
 run: build
     exec ./{{build_dir}}/{{bin}}

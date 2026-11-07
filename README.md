@@ -78,6 +78,7 @@ The shell is a layer-shell client. Start it inside a running niri session.
 - Clipboard history panel with text and image entries, thumbnails, search,
   arrow-key navigation and click/Enter-to-copy; history persists across restarts
 - Built-in PAM lock screen covering every monitor
+- `control-center`/`settings-toggle` view with every panel shown at once
 - Session menu with lock, suspend, log out, reboot and shut down actions
 - Right-click task menu: focus, floating, fullscreen, close
 - Per-monitor taskbars
@@ -111,7 +112,8 @@ nintysh msg panel toggle notifications
 ```
 
 Panel names: `launcher`, `audio`, `media`, `display`, `clipboard`,
-`calendar`, `network`, `power`, `notifications`, `session`.
+`calendar`, `network`, `power`, `notifications`, `session`, `wallpaper`,
+`control-center`.
 
 Audio output and microphone:
 
@@ -155,6 +157,20 @@ nintysh msg network connect "OPPO A78"
 nintysh msg network disconnect
 nintysh msg network refresh
 ```
+
+Wallpaper:
+
+```bash
+nintysh msg wallpaper open
+nintysh msg wallpaper set "~/walls/fine.png"
+nintysh msg wallpaper next
+nintysh msg wallpaper previous
+nintysh msg wallpaper random
+nintysh msg wallpaper get
+nintysh msg wallpaper-set "~/walls/fine.png"
+```
+
+The chooser scans `NINTYSH_WALLPAPER_DIR` (default `~/walls`) for image files.
 
 Media / MPRIS:
 
@@ -264,6 +280,7 @@ Example `config.user.h`:
 #define NINTYSH_BAR_SCALE 1.0
 #define NINTYSH_PANEL_SCALE 1.0
 #define NINTYSH_TASKBAR_APPS 1
+#define NINTYSH_WALLPAPER_DIR "~/walls"
 #define NINTYSH_FONT_FAMILY "Tahoma"
 #define NINTYSH_FONT_PX 12
 #define NINTYSH_COLOR_FACE 0xC0C0C0
@@ -336,6 +353,7 @@ Example:
       bar.height = 30;
       bar.scale = 1.0;
       bar.showApps = true;
+      wallpaper.directory = "~/walls";
       panels.scale = 1.0;
       font.size = 12;
       launcher.width = 280;

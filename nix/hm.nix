@@ -18,6 +18,7 @@ let
       "#define NINTYSH_BAR_SCALE ${toString settings.bar.scale}"
       "#define NINTYSH_TASKBAR_APPS ${if settings.bar.showApps then "1" else "0"}"
       "#define NINTYSH_PANEL_SCALE ${toString settings.panels.scale}"
+      "#define NINTYSH_WALLPAPER_DIR ${builtins.toJSON settings.wallpaper.directory}"
       "#define NINTYSH_BUTTON_Y ${toString settings.bar.buttonY}"
       "#define NINTYSH_BUTTON_HEIGHT ${toString settings.bar.buttonHeight}"
       "#define NINTYSH_MENU_WIDTH ${toString settings.launcher.width}"
@@ -153,6 +154,14 @@ in
               type = lib.types.number;
               default = 1.0;
               description = "Scaling factor for dropdown panels.";
+            };
+          };
+
+          wallpaper = {
+            directory = lib.mkOption {
+              type = lib.types.str;
+              default = "~/walls";
+              description = "Directory scanned by the wallpaper chooser.";
             };
           };
 
