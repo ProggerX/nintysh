@@ -1,5 +1,6 @@
 #include "bar.h"
 
+#include "auth.h"
 #include "config.h"
 #include "control.h"
 #include "mpris.h"
@@ -19,6 +20,22 @@
 #define MENU_WIDTH NINTYSH_MENU_WIDTH
 #define MENU_SIDEBAR NINTYSH_MENU_SIDEBAR
 
+static double bar_scale(void) {
+    return NINTYSH_BAR_SCALE > 0.1 ? NINTYSH_BAR_SCALE : 1.0;
+}
+
+static double panel_scale(void) {
+    return NINTYSH_PANEL_SCALE > 0.1 ? NINTYSH_PANEL_SCALE : 1.0;
+}
+
+static double bar_height_px(void) {
+    return BAR_HEIGHT * bar_scale();
+}
+
+static double panel_bar_height(void) {
+    return bar_height_px() / panel_scale();
+}
+
 typedef enum {
     HIT_NONE,
     HIT_START,
@@ -32,6 +49,7 @@ typedef enum {
     HIT_CLIPBOARD,
     HIT_NOTIFICATIONS,
     HIT_MEDIA,
+    HIT_SESSION,
 } HitKind;
 
 typedef struct {
@@ -67,6 +85,7 @@ typedef enum {
     PANEL_CLIPBOARD,
     PANEL_NOTIFICATIONS,
     PANEL_MEDIA,
+    PANEL_SESSION,
 } PanelKind;
 
 typedef struct {
@@ -100,6 +119,24 @@ typedef struct {
 } NotificationPopupHit;
 
 typedef struct {
+    gboolean is_image;
+    char *text;
+    char *mime;
+    char *label;
+    char *hash;
+    GBytes *data;
+    GdkTexture *texture;
+} ClipboardEntry;
+
+typedef struct {
+    char *ssid;
+    char *security;
+    int signal;
+    gboolean active;
+    gboolean saved;
+} WifiNetwork;
+
+typedef struct {
     double x;
     double y;
     double w;
@@ -115,6 +152,13 @@ typedef struct {
     GPtrArray *hits;
     char *output;
 } BarSurface;
+
+typedef struct {
+    NintyBar *bar;
+    GtkWidget *window;
+    GtkWidget *area;
+    gboolean interactive;
+} LockSurface;
 
 struct NintyBar {
     GtkApplication *app;
@@ -137,13 +181,22 @@ struct NintyBar {
     GPtrArray *apps;
     GPtrArray *menu_results;
     GPtrArray *surfaces;
+    GPtrArray *lock_surfaces;
     GPtrArray *active_hits;
     const char *active_output;
+    GtkWidget *lock_window;
+    GtkWidget *lock_area;
+    gboolean locked;
+    gboolean lock_authenticating;
+    char *lock_password;
+    char lock_message[160];
     GHashTable *icon_cache;
     GHashTable *app_index;
     GtkIconTheme *icon_theme;
     GPtrArray *clipboard_history;
-    char *last_clipboard;
+    GArray *clipboard_matches;
+    char *clipboard_query;
+    char *last_clipboard_hash;
     GPtrArray *audio_sinks;
     GPtrArray *audio_sources;
     GPtrArray *notifications;
@@ -169,6 +222,16 @@ struct NintyBar {
     gboolean battery_available;
     gboolean battery_charging;
     int battery_percent;
+    GPtrArray *wifi_networks;
+    gboolean wifi_enabled;
+    gboolean wifi_refreshing;
+    gboolean wifi_refresh_pending;
+    char *network_active_connection;
+    char *network_active_device;
+    int network_scroll;
+    gboolean network_password_mode;
+    char *network_password_ssid;
+    char *network_password;
 
     gboolean menu_open;
     char *menu_query;
@@ -181,9 +244,11 @@ struct NintyBar {
     int calendar_month;
     gboolean volume_dragging;
     gboolean volume_drag_source;
+    gboolean media_dragging;
     double volume_drag_x0;
     int panel_hover;
     int clipboard_scroll;
+    int clipboard_selected;
     int notification_scroll;
     gint64 context_window_id;
     double context_x;
@@ -206,6 +271,9 @@ static void notification_popup_update(NintyBar *bar);
 static void notification_popup_destroy(NintyBar *bar);
 static void notification_emit_closed(NintyBar *bar, guint id,
                                      guint reason);
+static void update_wifi(NintyBar *bar);
+static void ninty_lock_screen(NintyBar *bar);
+static void ninty_unlock_screen(NintyBar *bar);
 
 static void bar_clear_hits(NintyBar *bar) {
     if (bar->active_hits == NULL) {
@@ -260,7 +328,11 @@ static void bar_surface_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     NintyBar *bar = surface->bar;
     bar->active_hits = surface->hits;
     bar->active_output = surface->output;
-    bar_draw(area, cr, width, height, bar);
+    double scale = bar_scale();
+    cairo_save(cr);
+    cairo_scale(cr, scale, scale);
+    bar_draw(area, cr, (int)(width / scale), (int)(height / scale), bar);
+    cairo_restore(cr);
 }
 
 static void bar_queue_redraw(NintyBar *bar) {
@@ -988,6 +1060,519 @@ static gboolean update_network(NintyBar *bar) {
     return old_available != bar->network_available;
 }
 
+static void wifi_network_free(WifiNetwork *network) {
+    if (network == NULL) {
+        return;
+    }
+    g_free(network->ssid);
+    g_free(network->security);
+    g_free(network);
+}
+
+static gint wifi_network_compare(gconstpointer a, gconstpointer b) {
+    const WifiNetwork *na = *(WifiNetwork *const *)a;
+    const WifiNetwork *nb = *(WifiNetwork *const *)b;
+    if (na->active != nb->active) {
+        return na->active ? -1 : 1;
+    }
+    if (na->signal != nb->signal) {
+        return nb->signal - na->signal;
+    }
+    return g_utf8_collate(na->ssid, nb->ssid);
+}
+
+static void wifi_add_network(GPtrArray *networks, const char *ssid,
+                             int signal, const char *security,
+                             gboolean active) {
+    if (ssid == NULL || ssid[0] == '\0') {
+        return;
+    }
+    for (guint i = 0; i < networks->len; i++) {
+        WifiNetwork *network = g_ptr_array_index(networks, i);
+        if (g_strcmp0(network->ssid, ssid) != 0) {
+            continue;
+        }
+        if (active) {
+            network->active = TRUE;
+        }
+        if (signal > network->signal) {
+            network->signal = signal;
+            g_free(network->security);
+            network->security = g_strdup(security);
+        }
+        return;
+    }
+
+    WifiNetwork *network = g_new0(WifiNetwork, 1);
+    network->ssid = g_strdup(ssid);
+    network->signal = signal;
+    network->security = g_strdup(security);
+    network->active = active;
+    g_ptr_array_add(networks, network);
+}
+
+static void wifi_apply_sections(NintyBar *bar, const char *output) {
+    enum {
+        WIFI_SECTION_NONE,
+        WIFI_SECTION_STATE,
+        WIFI_SECTION_NETWORKS,
+        WIFI_SECTION_SAVED,
+        WIFI_SECTION_DEVICES,
+    } section = WIFI_SECTION_NONE;
+
+    GPtrArray *networks = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)wifi_network_free);
+    GPtrArray *saved = g_ptr_array_new_with_free_func(g_free);
+    gboolean wifi_enabled = bar->wifi_enabled;
+    char *active_connection = NULL;
+    char *active_device = NULL;
+
+    gchar **lines = g_strsplit(output, "\n", -1);
+    for (int i = 0; lines[i] != NULL; i++) {
+        char *line = lines[i];
+        if (g_strcmp0(line, "__NINTY_WIFI__") == 0) {
+            section = WIFI_SECTION_STATE;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_NETWORKS__") == 0) {
+            section = WIFI_SECTION_NETWORKS;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_SAVED__") == 0) {
+            section = WIFI_SECTION_SAVED;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_DEVICES__") == 0) {
+            section = WIFI_SECTION_DEVICES;
+            continue;
+        }
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (section == WIFI_SECTION_STATE) {
+            wifi_enabled = g_str_has_prefix(line, "enabled") ||
+                           strstr(line, "WIFI:enabled") != NULL;
+        } else if (section == WIFI_SECTION_NETWORKS) {
+            gboolean active = line[0] == '*';
+            char *security = strrchr(line, ':');
+            if (security == NULL) {
+                continue;
+            }
+            *security = '\0';
+            security++;
+            char *signal_text = strrchr(line, ':');
+            if (signal_text == NULL) {
+                continue;
+            }
+            *signal_text = '\0';
+            signal_text++;
+            char *ssid_sep = strchr(line, ':');
+            if (ssid_sep == NULL) {
+                continue;
+            }
+            char *ssid = ssid_sep + 1;
+            g_strstrip(ssid);
+            g_strstrip(security);
+            wifi_add_network(networks, ssid, atoi(signal_text), security,
+                             active);
+        } else if (section == WIFI_SECTION_SAVED) {
+            char *type_sep = strrchr(line, ':');
+            if (type_sep == NULL ||
+                strstr(type_sep + 1, "wireless") == NULL) {
+                continue;
+            }
+            *type_sep = '\0';
+            g_ptr_array_add(saved, g_strdup(line));
+        } else if (section == WIFI_SECTION_DEVICES) {
+            char *type_sep = strchr(line, ':');
+            if (type_sep == NULL) {
+                continue;
+            }
+            *type_sep = '\0';
+            char *device = line;
+            char *type = type_sep + 1;
+            char *state_sep = strchr(type, ':');
+            if (state_sep == NULL) {
+                continue;
+            }
+            *state_sep = '\0';
+            char *state = state_sep + 1;
+            char *connection_sep = strchr(state, ':');
+            if (connection_sep == NULL) {
+                continue;
+            }
+            *connection_sep = '\0';
+            const char *connection = connection_sep + 1;
+            if (g_strcmp0(state, "connected") != 0 ||
+                connection[0] == '\0') {
+                continue;
+            }
+            if (g_strcmp0(type, "wifi") == 0 ||
+                active_connection == NULL) {
+                g_free(active_device);
+                g_free(active_connection);
+                active_device = g_strdup(device);
+                active_connection = g_strdup(connection);
+                if (g_strcmp0(type, "wifi") == 0) {
+                    break;
+                }
+            }
+        }
+    }
+    g_strfreev(lines);
+
+    for (guint i = 0; i < networks->len; i++) {
+        WifiNetwork *network = g_ptr_array_index(networks, i);
+        for (guint j = 0; j < saved->len; j++) {
+            if (g_strcmp0(network->ssid,
+                          g_ptr_array_index(saved, j)) == 0) {
+                network->saved = TRUE;
+                break;
+            }
+        }
+    }
+    g_ptr_array_unref(saved);
+
+    g_ptr_array_sort(networks, wifi_network_compare);
+    g_ptr_array_set_size(bar->wifi_networks, 0);
+    for (guint i = 0; i < networks->len; i++) {
+        g_ptr_array_add(bar->wifi_networks,
+                        g_ptr_array_index(networks, i));
+    }
+    g_ptr_array_set_free_func(networks, NULL);
+    g_ptr_array_unref(networks);
+
+    bar->wifi_enabled = wifi_enabled;
+    g_free(bar->network_active_connection);
+    g_free(bar->network_active_device);
+    bar->network_active_connection = active_connection;
+    bar->network_active_device = active_device;
+
+    if (bar->network_active_connection == NULL) {
+        for (guint i = 0; i < bar->wifi_networks->len; i++) {
+            WifiNetwork *network =
+                g_ptr_array_index(bar->wifi_networks, i);
+            if (network->active) {
+                bar->network_active_connection =
+                    g_strdup(network->ssid);
+                break;
+            }
+        }
+    }
+
+    if (bar->panel_kind == PANEL_NETWORK) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    bar_queue_redraw(bar);
+}
+
+typedef struct {
+    NintyBar *bar;
+} WifiRefresh;
+
+static void wifi_refresh_done(GObject *source, GAsyncResult *result,
+                              gpointer user_data) {
+    WifiRefresh *refresh = user_data;
+    NintyBar *bar = refresh->bar;
+    g_free(refresh);
+
+    GBytes *output = NULL;
+    GBytes *errors = NULL;
+    GError *error = NULL;
+    g_subprocess_communicate_finish(G_SUBPROCESS(source), result, &output,
+                                    &errors, &error);
+    gboolean ok = g_subprocess_get_successful(G_SUBPROCESS(source));
+    g_clear_error(&error);
+    if (errors != NULL) {
+        g_bytes_unref(errors);
+    }
+    if (ok && output != NULL) {
+        gsize length = 0;
+        const char *data = g_bytes_get_data(output, &length);
+        char *text = g_strndup(data != NULL ? data : "", length);
+        wifi_apply_sections(bar, text);
+        g_free(text);
+    }
+    if (output != NULL) {
+        g_bytes_unref(output);
+    }
+
+    bar->wifi_refreshing = FALSE;
+    if (bar->wifi_refresh_pending) {
+        bar->wifi_refresh_pending = FALSE;
+        update_wifi(bar);
+    }
+}
+
+static void update_wifi(NintyBar *bar) {
+    if (bar->wifi_refreshing) {
+        bar->wifi_refresh_pending = TRUE;
+        return;
+    }
+
+    static const char script[] =
+        "printf '__NINTY_WIFI__\\n'; "
+        "nmcli -t -f WIFI general; "
+        "printf '__NINTY_NETWORKS__\\n'; "
+        "nmcli -t --escape no -f IN-USE,SSID,SIGNAL,SECURITY "
+        "device wifi list --rescan no; "
+        "printf '__NINTY_SAVED__\\n'; "
+        "nmcli -t --escape no -f NAME,TYPE connection show; "
+        "printf '__NINTY_DEVICES__\\n'; "
+        "nmcli -t -f DEVICE,TYPE,STATE,CONNECTION device status; "
+        "true";
+
+    const char *argv[] = { "/bin/sh", "-c", script, NULL };
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_newv(
+        argv,
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+            G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    if (process == NULL) {
+        g_clear_error(&error);
+        return;
+    }
+
+    bar->wifi_refreshing = TRUE;
+    WifiRefresh *refresh = g_new0(WifiRefresh, 1);
+    refresh->bar = bar;
+    g_subprocess_communicate_async(process, NULL, NULL,
+                                   wifi_refresh_done, refresh);
+    g_object_unref(process);
+}
+
+typedef struct {
+    NintyBar *bar;
+    char *success;
+    char *failure;
+} NetworkAction;
+
+static void network_action_free(NetworkAction *action) {
+    g_free(action->success);
+    g_free(action->failure);
+    g_free(action);
+}
+
+static void network_action_done(GObject *source, GAsyncResult *result,
+                                gpointer user_data) {
+    NetworkAction *action = user_data;
+    GError *error = NULL;
+    gboolean ok = g_subprocess_wait_check_finish(G_SUBPROCESS(source),
+                                                 result, &error);
+    if (ok) {
+        osd_show_text(action->bar, action->success);
+    } else {
+        osd_show_text(action->bar, action->failure);
+        g_clear_error(&error);
+    }
+    update_wifi(action->bar);
+    bar_queue_redraw(action->bar);
+    if (action->bar->panel_kind == PANEL_NETWORK) {
+        gtk_widget_queue_draw(action->bar->panel_area);
+    }
+    network_action_free(action);
+}
+
+static void network_run(NintyBar *bar, const char *const *argv,
+                        const char *success, const char *failure) {
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_newv(
+        argv, G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                  G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    if (process == NULL) {
+        osd_show_text(bar, failure);
+        g_clear_error(&error);
+        return;
+    }
+
+    NetworkAction *action = g_new0(NetworkAction, 1);
+    action->bar = bar;
+    action->success = g_strdup(success);
+    action->failure = g_strdup(failure);
+    g_subprocess_wait_check_async(process, NULL, network_action_done,
+                                  action);
+    g_object_unref(process);
+}
+
+static void network_set_wifi(NintyBar *bar, gboolean enabled) {
+    const char *argv[] = { "nmcli", "radio", "wifi",
+                           enabled ? "on" : "off", NULL };
+    char success[64];
+    g_snprintf(success, sizeof(success), "Wi-Fi %s",
+               enabled ? "enabled" : "disabled");
+    network_run(bar, argv, success, "Could not change Wi-Fi state");
+}
+
+static void network_toggle_wifi(NintyBar *bar) {
+    network_set_wifi(bar, !bar->wifi_enabled);
+}
+
+static void network_scan(NintyBar *bar) {
+    const char *argv[] = { "nmcli", "device", "wifi", "rescan", NULL };
+    network_run(bar, argv, "Scanning for Wi-Fi networks",
+                "Could not scan for Wi-Fi networks");
+}
+
+static void network_connect(NintyBar *bar, const char *ssid) {
+    if (ssid == NULL || ssid[0] == '\0') {
+        return;
+    }
+    const char *argv[] = { "nmcli", "device", "wifi", "connect", ssid,
+                           NULL };
+    char *success = g_strdup_printf("Connecting to %s", ssid);
+    char *failure = g_strdup_printf("Could not connect to %s", ssid);
+    network_run(bar, argv, success, failure);
+    g_free(success);
+    g_free(failure);
+}
+
+static void network_connect_password(NintyBar *bar, const char *ssid,
+                                     const char *password) {
+    if (ssid == NULL || ssid[0] == '\0' || password == NULL ||
+        password[0] == '\0') {
+        return;
+    }
+    const char *argv[] = { "nmcli", "device", "wifi", "connect", ssid,
+                           "password", password, NULL };
+    char *success = g_strdup_printf("Connecting to %s", ssid);
+    char *failure = g_strdup_printf("Could not connect to %s", ssid);
+    network_run(bar, argv, success, failure);
+    g_free(success);
+    g_free(failure);
+}
+
+static void network_password_cancel(NintyBar *bar) {
+    bar->network_password_mode = FALSE;
+    g_free(bar->network_password_ssid);
+    g_free(bar->network_password);
+    bar->network_password_ssid = NULL;
+    bar->network_password = NULL;
+    gtk_widget_queue_draw(bar->panel_area);
+}
+
+static void network_password_begin(NintyBar *bar, const char *ssid) {
+    g_free(bar->network_password_ssid);
+    g_free(bar->network_password);
+    bar->network_password_ssid = g_strdup(ssid);
+    bar->network_password = g_strdup("");
+    bar->network_password_mode = TRUE;
+    gtk_widget_queue_draw(bar->panel_area);
+}
+
+static void network_password_submit(NintyBar *bar) {
+    if (!bar->network_password_mode ||
+        bar->network_password == NULL ||
+        bar->network_password[0] == '\0') {
+        return;
+    }
+    char *ssid = g_strdup(bar->network_password_ssid);
+    char *password = g_strdup(bar->network_password);
+    network_password_cancel(bar);
+    network_connect_password(bar, ssid, password);
+    g_free(ssid);
+    g_free(password);
+}
+
+static void network_disconnect(NintyBar *bar) {
+    if (bar->network_active_connection != NULL) {
+        const char *argv[] = { "nmcli", "connection", "down", "id",
+                               bar->network_active_connection, NULL };
+        network_run(bar, argv, "Disconnected",
+                    "Could not disconnect");
+        return;
+    }
+    if (bar->network_active_device != NULL) {
+        const char *argv[] = { "nmcli", "device", "disconnect",
+                               bar->network_active_device, NULL };
+        network_run(bar, argv, "Disconnected",
+                    "Could not disconnect");
+        return;
+    }
+    osd_show_text(bar, "No active connection");
+}
+
+static void clipboard_entry_free(ClipboardEntry *entry) {
+    if (entry == NULL) {
+        return;
+    }
+    g_free(entry->text);
+    g_free(entry->mime);
+    g_free(entry->label);
+    g_free(entry->hash);
+    if (entry->data != NULL) {
+        g_bytes_unref(entry->data);
+    }
+    if (entry->texture != NULL) {
+        g_object_unref(entry->texture);
+    }
+    g_free(entry);
+}
+
+static const char *clipboard_entry_label(ClipboardEntry *entry) {
+    if (entry->label != NULL) {
+        return entry->label;
+    }
+    if (entry->text != NULL) {
+        return entry->text;
+    }
+    return "";
+}
+
+static char *clipboard_hash(const char *mime, gconstpointer data,
+                            gsize length) {
+    GChecksum *checksum = g_checksum_new(G_CHECKSUM_SHA256);
+    g_checksum_update(checksum, (const guchar *)mime, strlen(mime));
+    g_checksum_update(checksum, data, length);
+    char *hash = g_strdup(g_checksum_get_string(checksum));
+    g_checksum_free(checksum);
+    return hash;
+}
+
+static void clipboard_update_matches(NintyBar *bar) {
+    if (bar->clipboard_matches == NULL) {
+        return;
+    }
+    g_array_set_size(bar->clipboard_matches, 0);
+
+    char *query = NULL;
+    if (bar->clipboard_query != NULL && bar->clipboard_query[0] != '\0') {
+        query = g_utf8_casefold(bar->clipboard_query, -1);
+    }
+
+    for (guint i = 0; i < bar->clipboard_history->len; i++) {
+        ClipboardEntry *entry =
+            g_ptr_array_index(bar->clipboard_history, i);
+        const char *label = clipboard_entry_label(entry);
+        gboolean match = TRUE;
+        if (query != NULL) {
+            char *folded = g_utf8_casefold(label, -1);
+            match = strstr(folded, query) != NULL;
+            g_free(folded);
+        }
+        if (match) {
+            guint index = i;
+            g_array_append_val(bar->clipboard_matches, index);
+        }
+    }
+    g_free(query);
+
+    int count = (int)bar->clipboard_matches->len;
+    if (count == 0) {
+        bar->clipboard_selected = -1;
+        bar->clipboard_scroll = 0;
+    } else {
+        if (bar->clipboard_selected >= count) {
+            bar->clipboard_selected = count - 1;
+        }
+        if (bar->clipboard_selected < 0) {
+            bar->clipboard_selected = 0;
+        }
+    }
+}
+
 static void clipboard_trim(NintyBar *bar) {
     while (bar->clipboard_history->len > NINTYSH_CLIPBOARD_MAX_ENTRIES) {
         g_ptr_array_remove_index(
@@ -995,58 +1580,203 @@ static void clipboard_trim(NintyBar *bar) {
     }
 }
 
-static void clipboard_add(NintyBar *bar, const char *text) {
-    if (text == NULL || text[0] == '\0') {
-        return;
-    }
-
+static void clipboard_add_entry(NintyBar *bar, ClipboardEntry *entry) {
     for (guint i = 0; i < bar->clipboard_history->len; i++) {
-        const char *entry = g_ptr_array_index(bar->clipboard_history, i);
-        if (g_strcmp0(entry, text) == 0) {
+        ClipboardEntry *existing =
+            g_ptr_array_index(bar->clipboard_history, i);
+        if (g_strcmp0(existing->hash, entry->hash) == 0) {
             g_ptr_array_remove_index(bar->clipboard_history, i);
             break;
         }
     }
 
-    g_ptr_array_insert(bar->clipboard_history, 0,
-                       g_strndup(text, NINTYSH_CLIPBOARD_MAX_BYTES));
+    g_ptr_array_insert(bar->clipboard_history, 0, entry);
     clipboard_trim(bar);
+    clipboard_update_matches(bar);
+    gtk_widget_queue_draw(bar->panel_area);
 }
 
-static void clipboard_copy(NintyBar *bar, const char *text) {
+static void clipboard_copy_entry(NintyBar *bar, ClipboardEntry *entry) {
+    if (entry == NULL) {
+        return;
+    }
+
     GError *error = NULL;
-    GSubprocess *process = g_subprocess_new(
-        G_SUBPROCESS_FLAGS_STDIN_PIPE, &error, "wl-copy", NULL);
+    GSubprocess *process = NULL;
+    GBytes *bytes = NULL;
+    if (entry->is_image && entry->data != NULL) {
+        const char *mime = entry->mime != NULL ? entry->mime : "image/png";
+        process = g_subprocess_new(G_SUBPROCESS_FLAGS_STDIN_PIPE, &error,
+                                   "wl-copy", "--type", mime, NULL);
+        bytes = g_bytes_ref(entry->data);
+    } else {
+        process = g_subprocess_new(G_SUBPROCESS_FLAGS_STDIN_PIPE, &error,
+                                   "wl-copy", NULL);
+        const char *text = entry->text != NULL ? entry->text : "";
+        bytes = g_bytes_new(text, strlen(text));
+    }
     if (process == NULL) {
+        g_bytes_unref(bytes);
         g_clear_error(&error);
         return;
     }
 
-    GBytes *bytes = g_bytes_new(text, strlen(text));
     g_subprocess_communicate(process, bytes, NULL, NULL, NULL, &error);
     g_bytes_unref(bytes);
     g_clear_error(&error);
     g_object_unref(process);
 
-    g_free(bar->last_clipboard);
-    bar->last_clipboard = g_strdup(text);
-    osd_show_text(bar, "Copied to clipboard");
+    g_free(bar->last_clipboard_hash);
+    bar->last_clipboard_hash = g_strdup(entry->hash);
+    osd_show_text(bar, entry->is_image ? "Copied image"
+                                       : "Copied to clipboard");
     gtk_widget_queue_draw(bar->panel_area);
+}
+
+static void clipboard_copy_text(NintyBar *bar, const char *text) {
+    if (text == NULL) {
+        return;
+    }
+    ClipboardEntry *entry = g_new0(ClipboardEntry, 1);
+    entry->text = g_strdup(text);
+    entry->label = g_strdup(text);
+    entry->mime = g_strdup("text/plain");
+    entry->hash = clipboard_hash("text/plain", text, strlen(text));
+    clipboard_copy_entry(bar, entry);
+    clipboard_entry_free(entry);
+}
+
+static void clipboard_clear_history(NintyBar *bar) {
+    g_ptr_array_set_size(bar->clipboard_history, 0);
+    g_array_set_size(bar->clipboard_matches, 0);
+    bar->clipboard_scroll = 0;
+    bar->clipboard_selected = -1;
+    gtk_widget_queue_draw(bar->panel_area);
+}
+
+static gboolean run_command_sync_bytes(const char *command, GBytes **bytes) {
+    gchar **argv = NULL;
+    GError *error = NULL;
+    if (!g_shell_parse_argv(command, NULL, &argv, &error)) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    GSubprocess *process = g_subprocess_newv(
+        (const gchar *const *)argv,
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+            G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    g_strfreev(argv);
+    if (process == NULL) {
+        g_clear_error(&error);
+        return FALSE;
+    }
+
+    GBytes *output = NULL;
+    g_subprocess_communicate(process, NULL, NULL, &output, NULL, &error);
+    gboolean ok = g_subprocess_get_successful(process);
+    g_clear_error(&error);
+    g_object_unref(process);
+
+    if (!ok || output == NULL || g_bytes_get_size(output) == 0) {
+        if (output != NULL) {
+            g_bytes_unref(output);
+        }
+        return FALSE;
+    }
+    *bytes = output;
+    return TRUE;
 }
 
 static gboolean clipboard_tick(gpointer user_data) {
     NintyBar *bar = user_data;
-    char *output = NULL;
-    if (!run_command_sync("wl-paste --no-newline --type text", &output)) {
+    char *types = NULL;
+    char *image_mime = NULL;
+
+    if (run_command_sync("wl-paste --list-types", &types)) {
+        gchar **lines = g_strsplit(types, "\n", -1);
+        for (int i = 0; lines[i] != NULL; i++) {
+            g_strstrip(lines[i]);
+            if (!g_str_has_prefix(lines[i], "image/")) {
+                continue;
+            }
+            if (image_mime == NULL ||
+                g_strcmp0(lines[i], "image/png") == 0) {
+                g_free(image_mime);
+                image_mime = g_strdup(lines[i]);
+            }
+        }
+        g_strfreev(lines);
+    }
+    g_free(types);
+
+    if (image_mime != NULL) {
+        char command[256];
+        g_snprintf(command, sizeof(command), "wl-paste --type %s",
+                   image_mime);
+        GBytes *data = NULL;
+        if (run_command_sync_bytes(command, &data)) {
+            gsize length = g_bytes_get_size(data);
+            if (length <= NINTYSH_CLIPBOARD_IMAGE_MAX_BYTES) {
+                char *hash = clipboard_hash(
+                    image_mime, g_bytes_get_data(data, NULL), length);
+                if (g_strcmp0(hash, bar->last_clipboard_hash) != 0) {
+                    ClipboardEntry *entry = g_new0(ClipboardEntry, 1);
+                    entry->is_image = TRUE;
+                    entry->mime = g_strdup(image_mime);
+                    entry->data = data;
+                    entry->hash = hash;
+                    GError *error = NULL;
+                    entry->texture =
+                        gdk_texture_new_from_bytes(data, &error);
+                    g_clear_error(&error);
+                    if (entry->texture != NULL) {
+                        entry->label = g_strdup_printf(
+                            "Image %dx%d",
+                            gdk_texture_get_width(entry->texture),
+                            gdk_texture_get_height(entry->texture));
+                    } else {
+                        entry->label =
+                            g_strdup_printf("Image (%s)", image_mime);
+                    }
+                    g_free(bar->last_clipboard_hash);
+                    bar->last_clipboard_hash = g_strdup(hash);
+                    clipboard_add_entry(bar, entry);
+                } else {
+                    g_free(hash);
+                    g_bytes_unref(data);
+                }
+            } else {
+                g_bytes_unref(data);
+            }
+        }
+        g_free(image_mime);
         return G_SOURCE_CONTINUE;
     }
 
-    if (output != NULL && output[0] != '\0' &&
-        g_strcmp0(output, bar->last_clipboard) != 0) {
-        g_free(bar->last_clipboard);
-        bar->last_clipboard = g_strdup(output);
-        clipboard_add(bar, output);
-        gtk_widget_queue_draw(bar->panel_area);
+    char *output = NULL;
+    if (run_command_sync("wl-paste --no-newline --type text", &output) &&
+        output != NULL && output[0] != '\0') {
+        char *hash = clipboard_hash("text/plain", output, strlen(output));
+        if (g_strcmp0(hash, bar->last_clipboard_hash) != 0) {
+            ClipboardEntry *entry = g_new0(ClipboardEntry, 1);
+            entry->text =
+                g_strndup(output, NINTYSH_CLIPBOARD_MAX_BYTES);
+            entry->label = g_strdup(entry->text);
+            for (char *p = entry->label; *p != '\0'; p++) {
+                if (*p == '\n' || *p == '\r' || *p == '\t') {
+                    *p = ' ';
+                }
+            }
+            entry->mime = g_strdup("text/plain");
+            entry->hash = hash;
+            g_free(bar->last_clipboard_hash);
+            bar->last_clipboard_hash = g_strdup(hash);
+            clipboard_add_entry(bar, entry);
+        } else {
+            g_free(hash);
+        }
     }
     g_free(output);
     return G_SOURCE_CONTINUE;
@@ -1645,7 +2375,7 @@ static MenuLayout menu_layout(NintyBar *bar, double screen_w,
                               double screen_h) {
     MenuLayout layout = { 0 };
     int count = menu_command_mode(bar) ? 1 : (int)bar->menu_results->len;
-    double max_height = screen_h - BAR_HEIGHT - 8.0;
+    double max_height = screen_h - bar_height_px() - 8.0;
     if (max_height < 48.0) {
         max_height = 48.0;
     }
@@ -1662,7 +2392,7 @@ static MenuLayout menu_layout(NintyBar *bar, double screen_w,
     }
     layout.h = MIN(wanted, MIN(NINTYSH_MENU_MAX_HEIGHT, max_height));
     layout.x = 2.0;
-    layout.y = screen_h - BAR_HEIGHT - layout.h - 1.0;
+    layout.y = screen_h - bar_height_px() - layout.h - 1.0;
     if (layout.y < 2.0) {
         layout.y = 2.0;
     }
@@ -2065,8 +2795,8 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
         frame.h = 224.0;
         break;
     case PANEL_NETWORK:
-        frame.w = 252.0;
-        frame.h = 122.0;
+        frame.w = 340.0;
+        frame.h = 440.0;
         break;
     case PANEL_POWER:
         frame.w = 252.0;
@@ -2077,16 +2807,23 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
         frame.h = 84.0;
         break;
     case PANEL_CLIPBOARD:
-        frame.w = 320.0;
-        frame.h = 260.0;
+        frame.w = 340.0;
+        frame.h = 360.0;
         break;
     case PANEL_NOTIFICATIONS:
         frame.w = 360.0;
         frame.h = 300.0;
         break;
-    case PANEL_MEDIA:
+    case PANEL_MEDIA: {
+        int players = MAX(1, MIN((int)mpris_client_player_count(bar->mpris),
+                                 6));
         frame.w = 320.0;
-        frame.h = 330.0;
+        frame.h = 330.0 + players * 22.0;
+        break;
+    }
+    case PANEL_SESSION:
+        frame.w = 188.0;
+        frame.h = 152.0;
         break;
     default:
         frame.w = 1.0;
@@ -2096,10 +2833,10 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
 
     if (kind == PANEL_TASKMENU) {
         frame.x = bar->context_x;
-        frame.y = screen_h - BAR_HEIGHT - frame.h - 4.0;
+        frame.y = screen_h - panel_bar_height() - frame.h - 4.0;
     } else {
         frame.x = screen_w - frame.w - 6.0;
-        frame.y = screen_h - BAR_HEIGHT - frame.h - 6.0;
+        frame.y = screen_h - panel_bar_height() - frame.h - 6.0;
     }
     if (frame.x + frame.w > screen_w - 2.0) {
         frame.x = screen_w - frame.w - 2.0;
@@ -2445,34 +3182,279 @@ static void panel_draw_calendar(cairo_t *cr, NintyBar *bar,
     g_date_time_unref(first);
 }
 
+#define NETWORK_ROW_HEIGHT 28.0
+
+static void network_action_rects(const PanelFrame *frame,
+                                 double *scan_x, double *disconnect_x,
+                                 double *toggle_x, double *y,
+                                 double *scan_w, double *disconnect_w,
+                                 double *toggle_w, double *h) {
+    *y = frame->y + 76.0;
+    *h = 22.0;
+    *scan_w = 54.0;
+    *disconnect_w = 70.0;
+    *toggle_w = 68.0;
+    *toggle_x = frame->x + frame->w - 8.0 - *toggle_w;
+    *disconnect_x = *toggle_x - 6.0 - *disconnect_w;
+    *scan_x = *disconnect_x - 6.0 - *scan_w;
+}
+
+static double network_list_y(const PanelFrame *frame) {
+    return frame->y + 122.0;
+}
+
+static void network_password_rects(const PanelFrame *frame,
+                                   double *field_x, double *field_y,
+                                   double *field_w, double *field_h,
+                                   double *connect_x, double *cancel_x,
+                                   double *button_y, double *button_w,
+                                   double *button_h) {
+    *field_x = frame->x + 16.0;
+    *field_y = frame->y + 148.0;
+    *field_w = frame->w - 32.0;
+    *field_h = 22.0;
+    *button_y = frame->y + 180.0;
+    *button_w = 78.0;
+    *button_h = 24.0;
+    double gap = 10.0;
+    double start = frame->x + (frame->w - (*button_w * 2.0 + gap)) / 2.0;
+    *connect_x = start;
+    *cancel_x = start + *button_w + gap;
+}
+
+static int network_rows(const PanelFrame *frame) {
+    double available = frame->y + frame->h - 8.0 -
+                       network_list_y(frame);
+    return MAX(0, (int)(available / NETWORK_ROW_HEIGHT));
+}
+
+static int network_row_at(const PanelFrame *frame, double y) {
+    double list_y = network_list_y(frame);
+    if (y < list_y) {
+        return -1;
+    }
+    int row = (int)((y - list_y) / NETWORK_ROW_HEIGHT);
+    return row < network_rows(frame) ? row : -1;
+}
+
 static void panel_draw_network(cairo_t *cr, NintyBar *bar,
                                const PanelFrame *frame) {
     draw_panel_frame(cr, frame, "Network");
 
     cairo_save(cr);
-    cairo_translate(cr, frame->x + 14.0, frame->y + 32.0);
+    cairo_translate(cr, frame->x + 14.0, frame->y + 28.0);
     cairo_scale(cr, 2.0, 2.0);
     win98_draw_network_icon(cr, 0, 0, bar->network_available);
     cairo_restore(cr);
 
-    win98_draw_text(cr, frame->x + 54.0, frame->y + 30.0,
+    win98_draw_text(cr, frame->x + 54.0, frame->y + 26.0,
                     frame->w - 68.0, 18.0,
                     bar->network_available ? "Connected" : "Not connected",
                     WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
 
-    char host_text[256];
-    g_snprintf(host_text, sizeof(host_text), "Host: %s",
-               g_get_host_name());
-    win98_draw_text(cr, frame->x + 54.0, frame->y + 50.0,
-                    frame->w - 68.0, 17.0, host_text, WIN98_ALIGN_LEFT,
-                    FALSE, win98_text, TRUE);
-
-    win98_draw_text(cr, frame->x + 54.0, frame->y + 68.0,
-                    frame->w - 68.0, 17.0,
-                    niri_client_is_connected(bar->niri)
-                        ? "Niri IPC: online"
-                        : "Niri IPC: offline",
+    char connection_text[288];
+    g_snprintf(connection_text, sizeof(connection_text), "Connection: %s",
+               bar->network_active_connection != NULL
+                   ? bar->network_active_connection
+                   : "none");
+    win98_draw_text(cr, frame->x + 54.0, frame->y + 44.0,
+                    frame->w - 68.0, 17.0, connection_text,
                     WIN98_ALIGN_LEFT, FALSE, win98_text, TRUE);
+
+    double scan_x = 0;
+    double disconnect_x = 0;
+    double toggle_x = 0;
+    double action_y = 0;
+    double scan_w = 0;
+    double disconnect_w = 0;
+    double toggle_w = 0;
+    double action_h = 0;
+    network_action_rects(frame, &scan_x, &disconnect_x, &toggle_x,
+                         &action_y, &scan_w, &disconnect_w, &toggle_w,
+                         &action_h);
+
+    double check_x = frame->x + 16.0;
+    double check_y = action_y + 4.0;
+    win98_fill(cr, check_x, check_y, 13.0, 13.0, win98_white);
+    win98_bevel(cr, check_x, check_y, 13.0, 13.0, WIN98_BEVEL_SUNKEN);
+    if (bar->wifi_enabled) {
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_set_line_width(cr, 2.0);
+        cairo_move_to(cr, check_x + 3.0, check_y + 4.0);
+        cairo_line_to(cr, check_x + 5.5, check_y + 7.0);
+        cairo_line_to(cr, check_x + 10.0, check_y + 2.0);
+        cairo_stroke(cr);
+    }
+    win98_draw_text(cr, check_x + 19.0, action_y,
+                    scan_x - check_x - 27.0, action_h, "Wi-Fi",
+                    WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
+
+    const double button_xs[3] = { scan_x, disconnect_x, toggle_x };
+    const double button_ws[3] = { scan_w, disconnect_w, toggle_w };
+    const char *button_labels[3] = {
+        "Scan", "Disconnect", bar->wifi_enabled ? "Turn Off" : "Turn On"
+    };
+    gboolean button_enabled[3] = {
+        TRUE, bar->network_active_connection != NULL, TRUE
+    };
+    for (int i = 0; i < 3; i++) {
+        win98_fill(cr, button_xs[i], action_y, button_ws[i], action_h,
+                   win98_face);
+        win98_bevel(cr, button_xs[i], action_y, button_ws[i], action_h,
+                    WIN98_BEVEL_RAISED);
+        win98_draw_text(cr, button_xs[i], action_y, button_ws[i],
+                        action_h, button_labels[i], WIN98_ALIGN_CENTER,
+                        FALSE,
+                        button_enabled[i] ? win98_text
+                                          : win98_text_disabled,
+                        TRUE);
+    }
+
+    if (bar->network_password_mode) {
+        char prompt[256];
+        g_snprintf(prompt, sizeof(prompt), "Connect to %s",
+                   bar->network_password_ssid != NULL
+                       ? bar->network_password_ssid
+                       : "");
+        win98_draw_text(cr, frame->x + 16.0, frame->y + 116.0,
+                        frame->w - 32.0, 20.0, prompt, WIN98_ALIGN_LEFT,
+                        TRUE, win98_text, TRUE);
+
+        double field_x = 0;
+        double field_y = 0;
+        double field_w = 0;
+        double field_h = 0;
+        double connect_x = 0;
+        double cancel_x = 0;
+        double button_y = 0;
+        double button_w = 0;
+        double button_h = 0;
+        network_password_rects(frame, &field_x, &field_y, &field_w,
+                               &field_h, &connect_x, &cancel_x, &button_y,
+                               &button_w, &button_h);
+        win98_fill(cr, field_x, field_y, field_w, field_h, win98_white);
+        win98_bevel(cr, field_x, field_y, field_w, field_h,
+                    WIN98_BEVEL_SUNKEN);
+
+        const char *password = bar->network_password != NULL
+                                   ? bar->network_password
+                                   : "";
+        size_t length = strlen(password);
+        char *masked = g_malloc(length + 1);
+        memset(masked, '*', length);
+        masked[length] = '\0';
+        win98_draw_text(cr, field_x + 4.0, field_y + 2.0, field_w - 8.0,
+                        18.0, masked, WIN98_ALIGN_LEFT, FALSE, win98_text,
+                        TRUE);
+        int mask_width = win98_text_width(masked, FALSE);
+        double caret_x = MIN(field_x + 4.0 + mask_width,
+                             field_x + field_w - 5.0);
+        win98_fill(cr, caret_x, field_y + 4.0, 1.0, 14.0, win98_text);
+        g_free(masked);
+
+        gboolean has_password = password[0] != '\0';
+        const double button_xs[2] = { connect_x, cancel_x };
+        const char *labels[2] = { "Connect", "Cancel" };
+        for (int i = 0; i < 2; i++) {
+            win98_fill(cr, button_xs[i], button_y, button_w, button_h,
+                       win98_face);
+            win98_bevel(cr, button_xs[i], button_y, button_w, button_h,
+                        WIN98_BEVEL_RAISED);
+            win98_draw_text(cr, button_xs[i], button_y, button_w, button_h,
+                            labels[i], WIN98_ALIGN_CENTER, FALSE,
+                            i == 0 && !has_password ? win98_text_disabled
+                                                    : win98_text,
+                            TRUE);
+        }
+        win98_draw_text(cr, frame->x + 16.0, button_y + button_h + 6.0,
+                        frame->w - 32.0, 16.0,
+                        "Enter to connect, Esc to cancel",
+                        WIN98_ALIGN_CENTER, FALSE, win98_text_disabled,
+                        TRUE);
+        return;
+    }
+
+    double list_x = frame->x + 8.0;
+    double list_y = network_list_y(frame);
+    double list_w = frame->w - 24.0;
+    win98_draw_text(cr, frame->x + 16.0, frame->y + 102.0,
+                    frame->w - 32.0, 16.0, "Wi-Fi networks",
+                    WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
+
+    int rows = network_rows(frame);
+    int count = (int)bar->wifi_networks->len;
+    int max_scroll = MAX(0, count - rows);
+    bar->network_scroll = CLAMP(bar->network_scroll, 0, max_scroll);
+
+    if (bar->wifi_refreshing && count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w, NETWORK_ROW_HEIGHT,
+                        "Refreshing Wi-Fi...", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
+    } else if (!bar->wifi_enabled) {
+        win98_draw_text(cr, list_x, list_y, list_w, NETWORK_ROW_HEIGHT,
+                        "Wi-Fi is disabled", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
+    } else if (count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w, NETWORK_ROW_HEIGHT,
+                        "No Wi-Fi networks found", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+    }
+
+    for (int row = 0; row < rows; row++) {
+        int position = bar->network_scroll + row;
+        if (position >= count) {
+            break;
+        }
+        WifiNetwork *network =
+            g_ptr_array_index(bar->wifi_networks, (guint)position);
+        double y = list_y + row * NETWORK_ROW_HEIGHT;
+        gboolean selected = position == bar->panel_hover;
+        if (selected) {
+            win98_fill(cr, list_x, y, list_w, NETWORK_ROW_HEIGHT,
+                       win98_navy);
+        }
+        if (network->active) {
+            win98_fill(cr, list_x + 4.0, y + 10.0, 7.0, 7.0,
+                       selected ? win98_white : win98_navy);
+        }
+
+        char label[512];
+        if (network->security != NULL && network->security[0] != '\0') {
+            g_snprintf(label, sizeof(label), "%s  [%s]", network->ssid,
+                       network->security);
+        } else {
+            g_snprintf(label, sizeof(label), "%s", network->ssid);
+        }
+        win98_draw_text(cr, list_x + 18.0, y, list_w - 62.0,
+                        NETWORK_ROW_HEIGHT, label, WIN98_ALIGN_LEFT,
+                        network->active,
+                        selected ? win98_white : win98_text, TRUE);
+
+        char signal_text[16];
+        g_snprintf(signal_text, sizeof(signal_text), "%d%%",
+                   network->signal);
+        win98_draw_text(cr, list_x + list_w - 38.0, y, 34.0,
+                        NETWORK_ROW_HEIGHT, signal_text,
+                        WIN98_ALIGN_RIGHT, FALSE,
+                        selected ? win98_white : win98_text, FALSE);
+    }
+
+    if (max_scroll > 0) {
+        double bx = frame->x + frame->w - 14.0;
+        double by = list_y;
+        double bh = frame->y + frame->h - 8.0 - list_y;
+        win98_fill(cr, bx, by, 12.0, bh, win98_light);
+        win98_bevel(cr, bx, by, 12.0, bh, WIN98_BEVEL_SUNKEN);
+        double track_y = by + 12.0;
+        double track_h = bh - 24.0;
+        double thumb_h = MAX(16.0, track_h * rows / count);
+        thumb_h = MIN(thumb_h, track_h);
+        double fraction = (double)bar->network_scroll / max_scroll;
+        double thumb_y = track_y + (track_h - thumb_h) * fraction;
+        win98_fill(cr, bx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
+        win98_bevel(cr, bx + 1.0, thumb_y, 10.0, thumb_h,
+                    WIN98_BEVEL_RAISED);
+    }
 }
 
 static void panel_draw_power(cairo_t *cr, NintyBar *bar,
@@ -2498,13 +3480,26 @@ static void panel_draw_power(cairo_t *cr, NintyBar *bar,
                     WIN98_ALIGN_LEFT, FALSE, win98_text, FALSE);
 }
 
+static void clipboard_search_rect(const PanelFrame *frame, double *x,
+                                  double *y, double *w, double *h) {
+    *x = frame->x + 8.0;
+    *y = frame->y + frame->title_h + 6.0;
+    *w = frame->w - 16.0;
+    *h = 20.0;
+}
+
+static double clipboard_list_y(const PanelFrame *frame) {
+    return frame->y + frame->title_h + 6.0 + 20.0 + 6.0;
+}
+
 static int clipboard_rows(const PanelFrame *frame) {
-    return (int)((frame->h - frame->title_h - 16.0) /
-                 NINTYSH_CLIPBOARD_ROW_HEIGHT);
+    double available = frame->y + frame->h - 8.0 -
+                       clipboard_list_y(frame);
+    return MAX(0, (int)(available / NINTYSH_CLIPBOARD_ROW_HEIGHT));
 }
 
 static int clipboard_row_at(const PanelFrame *frame, double y) {
-    double list_y = frame->y + frame->title_h + 8.0;
+    double list_y = clipboard_list_y(frame);
     if (y < list_y) {
         return -1;
     }
@@ -2516,53 +3511,109 @@ static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
                                  const PanelFrame *frame) {
     draw_panel_frame(cr, frame, "Clipboard");
 
+    double sx = 0;
+    double sy = 0;
+    double sw = 0;
+    double sh = 0;
+    clipboard_search_rect(frame, &sx, &sy, &sw, &sh);
+    win98_fill(cr, sx, sy, sw, sh, win98_white);
+    win98_bevel(cr, sx, sy, sw, sh, WIN98_BEVEL_SUNKEN);
+
+    const char *query =
+        bar->clipboard_query != NULL ? bar->clipboard_query : "";
+    if (query[0] == '\0') {
+        win98_draw_text(cr, sx + 4.0, sy + 2.0, sw - 8.0, 16.0,
+                        "Search clipboard...", WIN98_ALIGN_LEFT, FALSE,
+                        win98_text_disabled, TRUE);
+    } else {
+        win98_draw_text(cr, sx + 4.0, sy + 2.0, sw - 8.0, 16.0, query,
+                        WIN98_ALIGN_LEFT, FALSE, win98_text, TRUE);
+    }
+    int query_width = win98_text_width(query, FALSE);
+    double caret_x = MIN(sx + 4.0 + query_width, sx + sw - 5.0);
+    win98_fill(cr, caret_x, sy + 4.0, 1.0, 12.0, win98_text);
+
     double list_x = frame->x + 8.0;
-    double list_y = frame->y + frame->title_h + 8.0;
+    double list_y = clipboard_list_y(frame);
     double list_w = frame->w - 24.0;
     int rows = clipboard_rows(frame);
-    int count = (int)bar->clipboard_history->len;
+    int count = (int)bar->clipboard_matches->len;
     int max_scroll = MAX(0, count - rows);
     bar->clipboard_scroll = CLAMP(bar->clipboard_scroll, 0, max_scroll);
 
-    if (count == 0) {
+    if (bar->clipboard_history->len == 0) {
         win98_draw_text(cr, list_x, list_y, list_w,
                         NINTYSH_CLIPBOARD_ROW_HEIGHT,
                         "Clipboard history is empty", WIN98_ALIGN_CENTER,
                         FALSE, win98_text_disabled, TRUE);
+    } else if (count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w,
+                        NINTYSH_CLIPBOARD_ROW_HEIGHT,
+                        "No matching entries", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
     }
 
     for (int row = 0; row < rows; row++) {
-        int index = bar->clipboard_scroll + row;
-        if (index >= count) {
+        int position = bar->clipboard_scroll + row;
+        if (position >= count) {
             break;
         }
+        guint index = g_array_index(bar->clipboard_matches, guint,
+                                    (guint)position);
+        ClipboardEntry *entry =
+            g_ptr_array_index(bar->clipboard_history, index);
         double y = list_y + row * NINTYSH_CLIPBOARD_ROW_HEIGHT;
-        gboolean selected = index == bar->panel_hover;
+        gboolean selected = position == bar->panel_hover ||
+                            position == bar->clipboard_selected;
         if (selected) {
             win98_fill(cr, list_x, y, list_w,
                        NINTYSH_CLIPBOARD_ROW_HEIGHT, win98_navy);
         }
-        const char *text = g_ptr_array_index(bar->clipboard_history, index);
-        win98_draw_text(cr, list_x + 4.0, y, list_w - 8.0,
-                        NINTYSH_CLIPBOARD_ROW_HEIGHT, text,
-                        WIN98_ALIGN_LEFT, FALSE,
-                        selected ? win98_white : win98_text, TRUE);
+
+        double label_x = list_x + 4.0;
+        double label_w = list_w - 8.0;
+        if (entry->is_image) {
+            double thumb = NINTYSH_CLIPBOARD_ROW_HEIGHT - 4.0;
+            double thumb_x = list_x + 2.0;
+            double thumb_y = y + 2.0;
+            win98_fill(cr, thumb_x, thumb_y, thumb, thumb, win98_white);
+            win98_bevel(cr, thumb_x, thumb_y, thumb, thumb,
+                        WIN98_BEVEL_SUNKEN);
+            if (entry->texture != NULL) {
+                draw_gdk_paintable(cr, GDK_PAINTABLE(entry->texture),
+                                   thumb_x + 2.0, thumb_y + 2.0,
+                                   thumb - 4.0);
+            } else {
+                cairo_save(cr);
+                cairo_translate(cr, thumb_x + 5.0, thumb_y + 5.0);
+                cairo_scale(cr, 1.3, 1.3);
+                win98_draw_clipboard_icon(cr, 0, 0);
+                cairo_restore(cr);
+            }
+            label_x = thumb_x + thumb + 8.0;
+            label_w = list_x + list_w - 4.0 - label_x;
+        }
+
+        win98_draw_text(cr, label_x, y, label_w,
+                        NINTYSH_CLIPBOARD_ROW_HEIGHT,
+                        clipboard_entry_label(entry), WIN98_ALIGN_LEFT,
+                        FALSE, selected ? win98_white : win98_text, TRUE);
     }
 
     if (max_scroll > 0) {
-        double sx = frame->x + frame->w - 14.0;
-        double sy = list_y;
-        double sh = frame->h - frame->title_h - 16.0;
-        win98_fill(cr, sx, sy, 12.0, sh, win98_light);
-        win98_bevel(cr, sx, sy, 12.0, sh, WIN98_BEVEL_SUNKEN);
-        double track_y = sy + 12.0;
-        double track_h = sh - 24.0;
+        double bx = frame->x + frame->w - 14.0;
+        double by = list_y;
+        double bh = frame->y + frame->h - 8.0 - list_y;
+        win98_fill(cr, bx, by, 12.0, bh, win98_light);
+        win98_bevel(cr, bx, by, 12.0, bh, WIN98_BEVEL_SUNKEN);
+        double track_y = by + 12.0;
+        double track_h = bh - 24.0;
         double thumb_h = MAX(16.0, track_h * rows / count);
         thumb_h = MIN(thumb_h, track_h);
         double fraction = (double)bar->clipboard_scroll / max_scroll;
         double thumb_y = track_y + (track_h - thumb_h) * fraction;
-        win98_fill(cr, sx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
-        win98_bevel(cr, sx + 1.0, thumb_y, 10.0, thumb_h,
+        win98_fill(cr, bx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
+        win98_bevel(cr, bx + 1.0, thumb_y, 10.0, thumb_h,
                     WIN98_BEVEL_RAISED);
     }
 }
@@ -2682,8 +3733,23 @@ static void format_media_time(gint64 microseconds, char *buffer,
                seconds / 60, seconds % 60);
 }
 
+static double media_players_y(const PanelFrame *frame) {
+    return frame->y + 324.0;
+}
+
+static int media_player_row_at(const PanelFrame *frame, double y) {
+    double start = media_players_y(frame);
+    if (y < start) {
+        return -1;
+    }
+    int row = (int)((y - start) / 22.0);
+    return row >= 0 ? row : -1;
+}
+
 static void panel_draw_media(cairo_t *cr, NintyBar *bar,
                              const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Media");
+
     const MprisState *state = mpris_client_state(bar->mpris);
     double art_size = 128.0;
     double art_x = frame->x + (frame->w - art_size) / 2.0;
@@ -2803,6 +3869,117 @@ static void panel_draw_media(cairo_t *cr, NintyBar *bar,
                         enabled[i] ? win98_text : win98_text_disabled,
                         FALSE);
     }
+
+    win98_draw_text(cr, frame->x + 16.0, frame->y + 306.0,
+                    frame->w - 32.0, 16.0, "Players", WIN98_ALIGN_LEFT,
+                    TRUE, win98_text, FALSE);
+
+    int count = (int)mpris_client_player_count(bar->mpris);
+    int shown = MIN(count, 6);
+    double list_x = frame->x + 8.0;
+    double list_w = frame->w - 24.0;
+    double players_y = media_players_y(frame);
+
+    if (count == 0) {
+        win98_draw_text(cr, list_x, players_y, list_w, 22.0,
+                        "No MPRIS players", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
+    }
+
+    for (int row = 0; row < shown; row++) {
+        const MprisPlayerInfo *info =
+            mpris_client_player(bar->mpris, (guint)row);
+        if (info == NULL) {
+            break;
+        }
+        double y = players_y + row * 22.0;
+        gboolean selected = row == bar->panel_hover;
+        gboolean active = state != NULL && state->available &&
+                          g_strcmp0(state->player, info->bus_name) == 0;
+        if (selected) {
+            win98_fill(cr, list_x, y, list_w, 22.0, win98_navy);
+        }
+        if (active) {
+            win98_fill(cr, list_x + 4.0, y + 7.0, 7.0, 7.0,
+                       selected ? win98_white : win98_navy);
+        }
+        win98_draw_text(cr, list_x + 18.0, y, list_w - 78.0, 22.0,
+                        info->identity, WIN98_ALIGN_LEFT, active,
+                        selected ? win98_white : win98_text, TRUE);
+        win98_draw_text(cr, list_x + list_w - 66.0, y, 62.0, 22.0,
+                        info->status != NULL ? info->status : "",
+                        WIN98_ALIGN_RIGHT, FALSE,
+                        selected ? win98_white : win98_text_disabled,
+                        TRUE);
+    }
+}
+
+static const char *session_menu_items[] = {
+    "Lock", "Suspend", "Log Out", NULL, "Reboot", "Shut Down"
+};
+
+static int session_menu_row_at(const PanelFrame *frame, double y) {
+    double row_y = frame->y + frame->title_h + 4.0;
+    for (int row = 0; row < 6; row++) {
+        if (session_menu_items[row] == NULL) {
+            row_y += 6.0;
+            continue;
+        }
+        if (y >= row_y && y < row_y + 24.0) {
+            return row;
+        }
+        row_y += 24.0;
+    }
+    return -1;
+}
+
+static void panel_draw_session(cairo_t *cr, NintyBar *bar,
+                               const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Session");
+
+    double x = frame->x + 4.0;
+    double w = frame->w - 8.0;
+    double y = frame->y + frame->title_h + 4.0;
+
+    for (int row = 0; row < 6; row++) {
+        if (session_menu_items[row] == NULL) {
+            win98_fill(cr, x, y + 2.0, w, 1.0, win98_shadow);
+            win98_fill(cr, x, y + 3.0, w, 1.0, win98_highlight);
+            y += 6.0;
+            continue;
+        }
+        if (bar->panel_hover == row) {
+            win98_fill(cr, x, y, w, 24.0, win98_navy);
+        }
+        win98_draw_text(cr, x + 8.0, y, w - 10.0, 24.0,
+                        session_menu_items[row], WIN98_ALIGN_LEFT, FALSE,
+                        bar->panel_hover == row ? win98_white : win98_text,
+                        FALSE);
+        y += 24.0;
+    }
+}
+
+static void session_menu_activate(NintyBar *bar, int row) {
+    (void)bar;
+    switch (row) {
+    case 0:
+        ninty_lock_screen(bar);
+        break;
+    case 1:
+        run_shell_command(NINTYSH_SUSPEND_COMMAND);
+        break;
+    case 2:
+        run_shell_command(NINTYSH_LOGOUT_COMMAND);
+        break;
+    case 4:
+        run_shell_command(NINTYSH_REBOOT_COMMAND);
+        break;
+    case 5:
+        run_shell_command(NINTYSH_SHUTDOWN_COMMAND);
+        break;
+    default:
+        break;
+    }
 }
 
 static const char *task_menu_items[] = {
@@ -2864,12 +4041,19 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     cairo_paint(cr);
     cairo_restore(cr);
 
-    if (bar->panel_kind == PANEL_NONE || width < 64 || height < 64) {
+    double scale = panel_scale();
+    double logical_w = width / scale;
+    double logical_h = height / scale;
+    if (bar->panel_kind == PANEL_NONE || logical_w < 64.0 ||
+        logical_h < 64.0) {
         return;
     }
 
+    cairo_save(cr);
+    cairo_scale(cr, scale, scale);
     cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
-    PanelFrame frame = panel_frame_for(bar, bar->panel_kind, width, height);
+    PanelFrame frame =
+        panel_frame_for(bar, bar->panel_kind, logical_w, logical_h);
 
     switch (bar->panel_kind) {
     case PANEL_VOLUME:
@@ -2897,9 +4081,13 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     case PANEL_MEDIA:
         panel_draw_media(cr, bar, &frame);
         break;
+    case PANEL_SESSION:
+        panel_draw_session(cr, bar, &frame);
+        break;
     default:
         break;
     }
+    cairo_restore(cr);
 }
 
 static int audio_percent_from_x(const PanelFrame *frame, double x) {
@@ -2930,7 +4118,12 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
 
     close_menu(bar);
     if (kind == PANEL_CLIPBOARD) {
+        g_free(bar->clipboard_query);
+        bar->clipboard_query = g_strdup("");
+        clipboard_update_matches(bar);
         bar->clipboard_scroll = 0;
+        bar->clipboard_selected =
+            bar->clipboard_matches->len > 0 ? 0 : -1;
         bar->panel_hover = -1;
     }
     if (kind == PANEL_NOTIFICATIONS) {
@@ -2948,6 +4141,14 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
         update_media_art(bar);
         bar->panel_hover = -1;
     }
+    if (kind == PANEL_NETWORK) {
+        if (bar->network_password_mode) {
+            network_password_cancel(bar);
+        }
+        update_wifi(bar);
+        bar->network_scroll = 0;
+        bar->panel_hover = -1;
+    }
     if (kind == PANEL_CALENDAR) {
         GDateTime *now = g_date_time_new_now_local();
         bar->calendar_year = g_date_time_get_year(now);
@@ -2958,6 +4159,7 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     bar->panel_kind = kind;
     bar->panel_hover = -1;
     bar->volume_dragging = FALSE;
+    bar->media_dragging = FALSE;
     gtk_widget_set_visible(bar->panel_window, TRUE);
     gtk_window_present(GTK_WINDOW(bar->panel_window));
     gtk_widget_grab_focus(bar->panel_area);
@@ -2987,6 +4189,12 @@ static void close_panel(NintyBar *bar) {
     }
     bar->panel_kind = PANEL_NONE;
     bar->volume_dragging = FALSE;
+    bar->media_dragging = FALSE;
+    bar->network_password_mode = FALSE;
+    g_free(bar->network_password_ssid);
+    g_free(bar->network_password);
+    bar->network_password_ssid = NULL;
+    bar->network_password = NULL;
     bar->panel_hover = -1;
     gtk_widget_set_visible(bar->panel_window, FALSE);
     bar_queue_redraw(bar);
@@ -3002,8 +4210,11 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
     (void)gesture;
     (void)n_press;
     NintyBar *bar = user_data;
-    double width = gtk_widget_get_width(bar->panel_area);
-    double height = gtk_widget_get_height(bar->panel_area);
+    double scale = panel_scale();
+    x /= scale;
+    y /= scale;
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
     PanelFrame frame = panel_frame_for(bar, bar->panel_kind, width, height);
 
     if (x < frame.x || x >= frame.x + frame.w || y < frame.y ||
@@ -3039,16 +4250,29 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         return;
     }
 
+    if (bar->panel_kind == PANEL_SESSION) {
+        int row = session_menu_row_at(&frame, y);
+        if (row >= 0) {
+            session_menu_activate(bar, row);
+            close_panel(bar);
+        }
+        return;
+    }
+
     if (bar->panel_kind == PANEL_CLIPBOARD) {
         int row = clipboard_row_at(&frame, y);
         double list_x = frame.x + 8.0;
         double list_w = frame.w - 24.0;
         if (row >= 0 && x >= list_x && x < list_x + list_w) {
-            int index = bar->clipboard_scroll + row;
-            if (index < (int)bar->clipboard_history->len) {
-                clipboard_copy(bar,
-                               g_ptr_array_index(bar->clipboard_history,
-                                                 index));
+            int position = bar->clipboard_scroll + row;
+            if (position < (int)bar->clipboard_matches->len) {
+                guint index = g_array_index(bar->clipboard_matches, guint,
+                                            (guint)position);
+                ClipboardEntry *entry =
+                    g_ptr_array_index(bar->clipboard_history, index);
+                bar->clipboard_selected = position;
+                clipboard_copy_entry(bar, entry);
+                gtk_widget_queue_draw(bar->panel_area);
             }
         }
         return;
@@ -3067,7 +4291,105 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         return;
     }
 
+    if (bar->panel_kind == PANEL_NETWORK) {
+        if (bar->network_password_mode) {
+            double field_x = 0;
+            double field_y = 0;
+            double field_w = 0;
+            double field_h = 0;
+            double connect_x = 0;
+            double cancel_x = 0;
+            double button_y = 0;
+            double button_w = 0;
+            double button_h = 0;
+            network_password_rects(&frame, &field_x, &field_y, &field_w,
+                                   &field_h, &connect_x, &cancel_x,
+                                   &button_y, &button_w, &button_h);
+            (void)field_x;
+            (void)field_y;
+            (void)field_w;
+            (void)field_h;
+            if (rect_contains(x, y, connect_x, button_y, button_w,
+                              button_h)) {
+                network_password_submit(bar);
+            } else if (rect_contains(x, y, cancel_x, button_y, button_w,
+                                     button_h)) {
+                network_password_cancel(bar);
+            }
+            return;
+        }
+
+        double scan_x = 0;
+        double disconnect_x = 0;
+        double toggle_x = 0;
+        double action_y = 0;
+        double scan_w = 0;
+        double disconnect_w = 0;
+        double toggle_w = 0;
+        double action_h = 0;
+        network_action_rects(&frame, &scan_x, &disconnect_x, &toggle_x,
+                             &action_y, &scan_w, &disconnect_w, &toggle_w,
+                             &action_h);
+        (void)action_h;
+
+        double check_x = frame.x + 16.0;
+        if (rect_contains(x, y, check_x, action_y, 18.0, 22.0) ||
+            rect_contains(x, y, toggle_x, action_y, toggle_w, 22.0)) {
+            network_toggle_wifi(bar);
+            return;
+        }
+        if (rect_contains(x, y, scan_x, action_y, scan_w, 22.0)) {
+            network_scan(bar);
+            return;
+        }
+        if (rect_contains(x, y, disconnect_x, action_y, disconnect_w,
+                          22.0)) {
+            if (bar->network_active_connection != NULL) {
+                network_disconnect(bar);
+            }
+            return;
+        }
+
+        int row = network_row_at(&frame, y);
+        double list_x = frame.x + 8.0;
+        double list_w = frame.w - 24.0;
+        if (row >= 0 && x >= list_x && x < list_x + list_w) {
+            int position = bar->network_scroll + row;
+            if (position < (int)bar->wifi_networks->len) {
+                WifiNetwork *network =
+                    g_ptr_array_index(bar->wifi_networks,
+                                      (guint)position);
+                if (network->active) {
+                    network_disconnect(bar);
+                } else if (network->security != NULL &&
+                           network->security[0] != '\0' &&
+                           !network->saved) {
+                    network_password_begin(bar, network->ssid);
+                } else {
+                    network_connect(bar, network->ssid);
+                }
+            }
+        }
+        return;
+    }
+
     if (bar->panel_kind == PANEL_MEDIA) {
+        int player_row = media_player_row_at(&frame, y);
+        double list_x = frame.x + 8.0;
+        double list_w = frame.w - 24.0;
+        if (player_row >= 0 && player_row < 6 &&
+            x >= list_x && x < list_x + list_w) {
+            const MprisPlayerInfo *info =
+                mpris_client_player(bar->mpris, (guint)player_row);
+            if (info != NULL) {
+                mpris_client_select_player(bar->mpris, info->bus_name);
+                mpris_client_poll(bar->mpris);
+                update_media_art(bar);
+                gtk_widget_queue_draw(bar->panel_area);
+            }
+            return;
+        }
+
         const MprisState *state = mpris_client_state(bar->mpris);
         if (state == NULL || !state->available) {
             return;
@@ -3199,12 +4521,37 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
                              double start_y, gpointer user_data) {
     (void)gesture;
     NintyBar *bar = user_data;
+    double scale = panel_scale();
+    start_x /= scale;
+    start_y /= scale;
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+
+    if (bar->panel_kind == PANEL_MEDIA) {
+        const MprisState *state = mpris_client_state(bar->mpris);
+        if (state == NULL || !state->available ||
+            state->length_us <= 0 || !state->can_seek) {
+            return;
+        }
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_MEDIA, width, height);
+        double px = 0;
+        double py = 0;
+        double pw = 0;
+        double ph = 0;
+        media_progress_rect(&frame, &px, &py, &pw, &ph);
+        if (start_x >= px - 6.0 && start_x < px + pw + 6.0 &&
+            start_y >= py - 8.0 && start_y < py + ph + 8.0) {
+            bar->media_dragging = TRUE;
+            bar->volume_drag_x0 = start_x;
+        }
+        return;
+    }
+
     if (bar->panel_kind != PANEL_VOLUME) {
         return;
     }
 
-    double width = gtk_widget_get_width(bar->panel_area);
-    double height = gtk_widget_get_height(bar->panel_area);
     PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
     AudioGeometry geometry;
     audio_geometry(bar, &frame, &geometry);
@@ -3237,12 +4584,36 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
     (void)gesture;
     (void)offset_y;
     NintyBar *bar = user_data;
+    double scale = panel_scale();
+    offset_x /= scale;
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+
+    if (bar->media_dragging) {
+        const MprisState *state = mpris_client_state(bar->mpris);
+        if (state == NULL || state->length_us <= 0) {
+            return;
+        }
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_MEDIA, width, height);
+        double px = 0;
+        double py = 0;
+        double pw = 0;
+        double ph = 0;
+        media_progress_rect(&frame, &px, &py, &pw, &ph);
+        double fraction = CLAMP(
+            (bar->volume_drag_x0 + offset_x - (px + 2.0)) / (pw - 4.0),
+            0.0, 1.0);
+        mpris_client_set_position(bar->mpris,
+                                  (gint64)(state->length_us * fraction));
+        gtk_widget_queue_draw(bar->panel_area);
+        return;
+    }
+
     if (!bar->volume_dragging) {
         return;
     }
 
-    double width = gtk_widget_get_width(bar->panel_area);
-    double height = gtk_widget_get_height(bar->panel_area);
     PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
     int percent = audio_percent_from_x(
         &frame, bar->volume_drag_x0 + offset_x);
@@ -3259,6 +4630,13 @@ static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
     (void)offset_x;
     (void)offset_y;
     NintyBar *bar = user_data;
+    if (bar->media_dragging) {
+        bar->media_dragging = FALSE;
+        mpris_client_poll(bar->mpris);
+        update_media_art(bar);
+        gtk_widget_queue_draw(bar->panel_area);
+        return;
+    }
     if (!bar->volume_dragging) {
         return;
     }
@@ -3277,12 +4655,17 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
     NintyBar *bar = user_data;
     if (bar->panel_kind != PANEL_TASKMENU &&
         bar->panel_kind != PANEL_CLIPBOARD &&
-        bar->panel_kind != PANEL_NOTIFICATIONS) {
+        bar->panel_kind != PANEL_NOTIFICATIONS &&
+        bar->panel_kind != PANEL_NETWORK &&
+        bar->panel_kind != PANEL_SESSION &&
+        bar->panel_kind != PANEL_MEDIA) {
         return;
     }
 
-    double width = gtk_widget_get_width(bar->panel_area);
-    double height = gtk_widget_get_height(bar->panel_area);
+    double scale = panel_scale();
+    y /= scale;
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
     PanelFrame frame =
         panel_frame_for(bar, bar->panel_kind, width, height);
     int hover = -1;
@@ -3290,6 +4673,12 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
         hover = task_menu_row_at(&frame, y);
     } else if (bar->panel_kind == PANEL_CLIPBOARD) {
         hover = clipboard_row_at(&frame, y);
+    } else if (bar->panel_kind == PANEL_NETWORK) {
+        hover = network_row_at(&frame, y);
+    } else if (bar->panel_kind == PANEL_SESSION) {
+        hover = session_menu_row_at(&frame, y);
+    } else if (bar->panel_kind == PANEL_MEDIA) {
+        hover = media_player_row_at(&frame, y);
     } else {
         hover = notification_row_at(&frame, y);
     }
@@ -3304,6 +4693,7 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
     (void)controller;
     (void)dx;
     NintyBar *bar = user_data;
+    double scale = panel_scale();
     if (bar->panel_kind == PANEL_MEDIA) {
         gint64 offset = dy > 0 ? -5000000 : 5000000;
         mpris_client_seek(bar->mpris, offset);
@@ -3313,18 +4703,29 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
         int delta = dy > 0 ? -2 : 2;
         apply_volume(bar, bar->volume_percent + delta, TRUE);
     } else if (bar->panel_kind == PANEL_CLIPBOARD) {
-        double width = gtk_widget_get_width(bar->panel_area);
-        double height = gtk_widget_get_height(bar->panel_area);
+        double width = gtk_widget_get_width(bar->panel_area) / scale;
+        double height = gtk_widget_get_height(bar->panel_area) / scale;
         PanelFrame frame = panel_frame_for(bar, PANEL_CLIPBOARD, width, height);
-        int max_scroll = MAX(0, (int)bar->clipboard_history->len -
+        int max_scroll = MAX(0, (int)bar->clipboard_matches->len -
                                    clipboard_rows(&frame));
         int step = dy > 0 ? 3 : -3;
         bar->clipboard_scroll =
             CLAMP(bar->clipboard_scroll + step, 0, max_scroll);
         gtk_widget_queue_draw(bar->panel_area);
+    } else if (bar->panel_kind == PANEL_NETWORK) {
+        double width = gtk_widget_get_width(bar->panel_area) / scale;
+        double height = gtk_widget_get_height(bar->panel_area) / scale;
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_NETWORK, width, height);
+        int max_scroll = MAX(0, (int)bar->wifi_networks->len -
+                                   network_rows(&frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->network_scroll =
+            CLAMP(bar->network_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
     } else if (bar->panel_kind == PANEL_NOTIFICATIONS) {
-        double width = gtk_widget_get_width(bar->panel_area);
-        double height = gtk_widget_get_height(bar->panel_area);
+        double width = gtk_widget_get_width(bar->panel_area) / scale;
+        double height = gtk_widget_get_height(bar->panel_area) / scale;
         PanelFrame frame =
             panel_frame_for(bar, PANEL_NOTIFICATIONS, width, height);
         int max_scroll = MAX(0, (int)bar->notifications->len -
@@ -3337,18 +4738,167 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
     return TRUE;
 }
 
+static void clipboard_ensure_selection_visible(NintyBar *bar) {
+    if (bar->panel_kind != PANEL_CLIPBOARD || bar->panel_area == NULL) {
+        return;
+    }
+    double scale = panel_scale();
+    double width = gtk_widget_get_width(bar->panel_area) / scale;
+    double height = gtk_widget_get_height(bar->panel_area) / scale;
+    PanelFrame frame = panel_frame_for(bar, PANEL_CLIPBOARD, width, height);
+    int rows = clipboard_rows(&frame);
+    int count = (int)bar->clipboard_matches->len;
+    if (count == 0 || rows <= 0) {
+        return;
+    }
+    if (bar->clipboard_selected < bar->clipboard_scroll) {
+        bar->clipboard_scroll = bar->clipboard_selected;
+    } else if (bar->clipboard_selected >=
+               bar->clipboard_scroll + rows) {
+        bar->clipboard_scroll = bar->clipboard_selected - rows + 1;
+    }
+    int max_scroll = MAX(0, count - rows);
+    bar->clipboard_scroll =
+        CLAMP(bar->clipboard_scroll, 0, max_scroll);
+}
+
+static void clipboard_query_changed(NintyBar *bar) {
+    clipboard_update_matches(bar);
+    bar->clipboard_scroll = 0;
+    bar->clipboard_selected =
+        bar->clipboard_matches->len > 0 ? 0 : -1;
+    clipboard_ensure_selection_visible(bar);
+    gtk_widget_queue_draw(bar->panel_area);
+}
+
 static gboolean panel_key_pressed(GtkEventControllerKey *controller,
                                   guint keyval, guint keycode,
                                   GdkModifierType state, gpointer user_data) {
     (void)controller;
     (void)keycode;
-    (void)state;
     NintyBar *bar = user_data;
 
+    if (bar->panel_kind == PANEL_NETWORK &&
+        bar->network_password_mode) {
+        if (keyval == GDK_KEY_Escape) {
+            network_password_cancel(bar);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+            network_password_submit(bar);
+            return TRUE;
+        }
+        if (keyval == GDK_KEY_BackSpace) {
+            gsize length = strlen(bar->network_password);
+            if (length > 0) {
+                char *previous = g_utf8_find_prev_char(
+                    bar->network_password,
+                    bar->network_password + length);
+                if (previous != NULL) {
+                    *previous = '\0';
+                    gtk_widget_queue_draw(bar->panel_area);
+                }
+            }
+            return TRUE;
+        }
+        if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)) {
+            return FALSE;
+        }
+        gunichar character = gdk_keyval_to_unicode(keyval);
+        if (character != 0 && !g_unichar_iscntrl(character)) {
+            char utf8[8] = { 0 };
+            int length = g_unichar_to_utf8(character, utf8);
+            utf8[length] = '\0';
+            char *next = g_strconcat(bar->network_password, utf8, NULL);
+            g_free(bar->network_password);
+            bar->network_password = next;
+            gtk_widget_queue_draw(bar->panel_area);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    if (bar->panel_kind != PANEL_CLIPBOARD) {
+        if (keyval == GDK_KEY_Escape) {
+            close_panel(bar);
+            return TRUE;
+        }
+        return FALSE;
+    }
+
+    int count = (int)bar->clipboard_matches->len;
     if (keyval == GDK_KEY_Escape) {
-        close_panel(bar);
+        if (bar->clipboard_query != NULL &&
+            bar->clipboard_query[0] != '\0') {
+            g_free(bar->clipboard_query);
+            bar->clipboard_query = g_strdup("");
+            clipboard_query_changed(bar);
+        } else {
+            close_panel(bar);
+        }
         return TRUE;
     }
+
+    if (keyval == GDK_KEY_Up || keyval == GDK_KEY_Down) {
+        if (count > 0) {
+            int selected = bar->clipboard_selected;
+            if (selected < 0) {
+                selected = 0;
+            } else if (keyval == GDK_KEY_Up) {
+                selected--;
+            } else {
+                selected++;
+            }
+            bar->clipboard_selected = CLAMP(selected, 0, count - 1);
+            clipboard_ensure_selection_visible(bar);
+            gtk_widget_queue_draw(bar->panel_area);
+        }
+        return TRUE;
+    }
+
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        if (bar->clipboard_selected >= 0 &&
+            bar->clipboard_selected < count) {
+            guint index = g_array_index(
+                bar->clipboard_matches, guint,
+                (guint)bar->clipboard_selected);
+            ClipboardEntry *entry =
+                g_ptr_array_index(bar->clipboard_history, index);
+            clipboard_copy_entry(bar, entry);
+            gtk_widget_queue_draw(bar->panel_area);
+        }
+        return TRUE;
+    }
+
+    if (keyval == GDK_KEY_BackSpace) {
+        gsize length = strlen(bar->clipboard_query);
+        if (length > 0) {
+            char *previous = g_utf8_find_prev_char(
+                bar->clipboard_query, bar->clipboard_query + length);
+            if (previous != NULL) {
+                *previous = '\0';
+                clipboard_query_changed(bar);
+            }
+        }
+        return TRUE;
+    }
+
+    if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)) {
+        return FALSE;
+    }
+
+    gunichar character = gdk_keyval_to_unicode(keyval);
+    if (character != 0 && !g_unichar_iscntrl(character)) {
+        char utf8[8] = { 0 };
+        int length = g_unichar_to_utf8(character, utf8);
+        utf8[length] = '\0';
+        char *next = g_strconcat(bar->clipboard_query, utf8, NULL);
+        g_free(bar->clipboard_query);
+        bar->clipboard_query = next;
+        clipboard_query_changed(bar);
+        return TRUE;
+    }
+
     return FALSE;
 }
 
@@ -3431,6 +4981,384 @@ static void osd_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     } else {
         win98_draw_text(cr, 8, 4, width - 16, height - 8, bar->osd_text,
                         WIN98_ALIGN_CENTER, TRUE, win98_text, TRUE);
+    }
+}
+
+static void lock_panel_rect(int width, int height, double *x, double *y,
+                            double *w, double *h) {
+    *w = 360.0;
+    *h = 240.0;
+    *x = (width - *w) / 2.0;
+    *y = (height - *h) / 2.0;
+}
+
+static void lock_button_rect(int width, int height, double *x, double *y,
+                             double *w, double *h) {
+    double panel_x = 0;
+    double panel_y = 0;
+    double panel_w = 0;
+    double panel_h = 0;
+    lock_panel_rect(width, height, &panel_x, &panel_y, &panel_w, &panel_h);
+    *w = 96.0;
+    *h = 28.0;
+    *x = panel_x + (panel_w - *w) / 2.0;
+    *y = panel_y + 132.0;
+}
+
+static void lock_surface_draw(GtkDrawingArea *area, cairo_t *cr, int width,
+                              int height, gpointer user_data) {
+    (void)area;
+    LockSurface *surface = user_data;
+    NintyBar *bar = surface->bar;
+
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    win98_fill(cr, 0, 0, width, height, win98_dark);
+
+    double x = 0;
+    double y = 0;
+    double w = 0;
+    double h = 0;
+    lock_panel_rect(width, height, &x, &y, &w, &h);
+    win98_fill(cr, x, y, w, h, win98_face);
+    win98_bevel(cr, x, y, w, h, WIN98_BEVEL_RAISED);
+
+    double tx = x + 3.0;
+    double ty = y + 3.0;
+    double tw = w - 6.0;
+    double th = 20.0;
+    cairo_pattern_t *gradient =
+        cairo_pattern_create_linear(tx, ty, tx, ty + th);
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 0.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_TOP));
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 1.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_BOTTOM));
+    cairo_set_source(cr, gradient);
+    cairo_rectangle(cr, tx, ty, tw, th);
+    cairo_fill(cr);
+    cairo_pattern_destroy(gradient);
+    win98_draw_text(cr, tx + 6.0, ty, tw - 12.0, th, "Nintysh Locked",
+                    WIN98_ALIGN_LEFT, TRUE, win98_white, FALSE);
+
+    win98_draw_text(cr, x + 24.0, y + 36.0, w - 48.0, 18.0,
+                    g_get_user_name(), WIN98_ALIGN_CENTER, TRUE,
+                    win98_text, FALSE);
+
+    double fx = x + 24.0;
+    double fy = y + 72.0;
+    double fw = w - 48.0;
+    double fh = 26.0;
+    win98_fill(cr, fx, fy, fw, fh, win98_white);
+    win98_bevel(cr, fx, fy, fw, fh, WIN98_BEVEL_SUNKEN);
+
+    const char *password =
+        bar->lock_password != NULL ? bar->lock_password : "";
+    size_t length = strlen(password);
+    char *masked = g_malloc(length + 1);
+    memset(masked, '*', length);
+    masked[length] = '\0';
+    win98_draw_text(cr, fx + 5.0, fy + 3.0, fw - 10.0, 20.0, masked,
+                    WIN98_ALIGN_LEFT, FALSE, win98_text, TRUE);
+    int mask_width = win98_text_width(masked, FALSE);
+    double caret_x = MIN(fx + 5.0 + mask_width, fx + fw - 6.0);
+    win98_fill(cr, caret_x, fy + 5.0, 1.0, 16.0, win98_text);
+    g_free(masked);
+
+    double bx = 0;
+    double by = 0;
+    double bw = 0;
+    double bh = 0;
+    lock_button_rect(width, height, &bx, &by, &bw, &bh);
+    win98_fill(cr, bx, by, bw, bh, win98_face);
+    win98_bevel(cr, bx, by, bw, bh, WIN98_BEVEL_RAISED);
+    win98_draw_text(cr, bx, by, bw, bh,
+                    bar->lock_authenticating ? "Checking..." : "Unlock",
+                    WIN98_ALIGN_CENTER, TRUE,
+                    bar->lock_authenticating ? win98_text_disabled
+                                             : win98_text,
+                    FALSE);
+
+    win98_draw_text(cr, x + 16.0, y + 172.0, w - 32.0, 18.0,
+                    bar->lock_message, WIN98_ALIGN_CENTER, FALSE,
+                    win98_text, TRUE);
+}
+
+typedef struct {
+    NintyBar *bar;
+    char *password;
+    char *message;
+} LockAuth;
+
+static void lock_auth_free(LockAuth *auth) {
+    g_free(auth->password);
+    g_free(auth->message);
+    g_free(auth);
+}
+
+static void lock_auth_thread(GTask *task, gpointer source,
+                             gpointer task_data, GCancellable *cancellable) {
+    (void)source;
+    (void)cancellable;
+    LockAuth *auth = task_data;
+    char *message = NULL;
+    gboolean ok = ninty_auth_password(auth->password, &message);
+    auth->message = message;
+    g_task_return_boolean(task, ok);
+}
+
+static void lock_queue_draw(NintyBar *bar) {
+    for (guint i = 0; i < bar->lock_surfaces->len; i++) {
+        LockSurface *surface = g_ptr_array_index(bar->lock_surfaces, i);
+        gtk_widget_queue_draw(surface->area);
+    }
+}
+
+static void ninty_unlock_screen(NintyBar *bar) {
+    if (!bar->locked) {
+        return;
+    }
+    bar->locked = FALSE;
+    bar->lock_authenticating = FALSE;
+    g_free(bar->lock_password);
+    bar->lock_password = NULL;
+    bar->lock_message[0] = '\0';
+
+    for (guint i = 0; i < bar->lock_surfaces->len; i++) {
+        LockSurface *surface = g_ptr_array_index(bar->lock_surfaces, i);
+        gtk_window_destroy(GTK_WINDOW(surface->window));
+    }
+    g_ptr_array_set_size(bar->lock_surfaces, 0);
+    bar->lock_window = NULL;
+    bar->lock_area = NULL;
+    bar_queue_redraw(bar);
+}
+
+static void lock_auth_done(GObject *source, GAsyncResult *result,
+                           gpointer user_data);
+
+static void lock_submit(NintyBar *bar) {
+    if (!bar->locked || bar->lock_authenticating ||
+        bar->lock_password == NULL || bar->lock_password[0] == '\0') {
+        return;
+    }
+    bar->lock_authenticating = TRUE;
+    g_strlcpy(bar->lock_message, "Checking password...",
+              sizeof(bar->lock_message));
+    lock_queue_draw(bar);
+
+    LockAuth *auth = g_new0(LockAuth, 1);
+    auth->bar = bar;
+    auth->password = g_strdup(bar->lock_password);
+    GTask *task = g_task_new(NULL, NULL, lock_auth_done, auth);
+    g_task_set_task_data(task, auth, (GDestroyNotify)lock_auth_free);
+    g_task_run_in_thread(task, lock_auth_thread);
+    g_object_unref(task);
+}
+
+static void lock_auth_done(GObject *source, GAsyncResult *result,
+                           gpointer user_data) {
+    (void)source;
+    LockAuth *auth = user_data;
+    NintyBar *bar = auth->bar;
+    GError *error = NULL;
+    gboolean ok = g_task_propagate_boolean(G_TASK(result), &error);
+    g_clear_error(&error);
+
+    bar->lock_authenticating = FALSE;
+    if (ok) {
+        ninty_unlock_screen(bar);
+        return;
+    }
+
+    g_free(bar->lock_password);
+    bar->lock_password = g_strdup("");
+    g_strlcpy(bar->lock_message,
+              auth->message != NULL ? auth->message : "Incorrect password",
+              sizeof(bar->lock_message));
+    lock_queue_draw(bar);
+}
+
+static gboolean lock_key_pressed(GtkEventControllerKey *controller,
+                                 guint keyval, guint keycode,
+                                 GdkModifierType state,
+                                 gpointer user_data) {
+    (void)controller;
+    (void)keycode;
+    NintyBar *bar = user_data;
+    if (!bar->locked) {
+        return FALSE;
+    }
+    if (bar->lock_authenticating) {
+        return TRUE;
+    }
+
+    if (keyval == GDK_KEY_Return || keyval == GDK_KEY_KP_Enter) {
+        lock_submit(bar);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_Escape) {
+        g_free(bar->lock_password);
+        bar->lock_password = g_strdup("");
+        lock_queue_draw(bar);
+        return TRUE;
+    }
+    if (keyval == GDK_KEY_BackSpace) {
+        gsize length = strlen(bar->lock_password);
+        if (length > 0) {
+            char *previous = g_utf8_find_prev_char(
+                bar->lock_password, bar->lock_password + length);
+            if (previous != NULL) {
+                *previous = '\0';
+                lock_queue_draw(bar);
+            }
+        }
+        return TRUE;
+    }
+    if (state & (GDK_CONTROL_MASK | GDK_ALT_MASK | GDK_SUPER_MASK)) {
+        return FALSE;
+    }
+
+    gunichar character = gdk_keyval_to_unicode(keyval);
+    if (character != 0 && !g_unichar_iscntrl(character)) {
+        char utf8[8] = { 0 };
+        int length = g_unichar_to_utf8(character, utf8);
+        utf8[length] = '\0';
+        char *next = g_strconcat(bar->lock_password, utf8, NULL);
+        g_free(bar->lock_password);
+        bar->lock_password = next;
+        lock_queue_draw(bar);
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static void lock_clicked(GtkGestureClick *gesture, int n_press, double x,
+                         double y, gpointer user_data) {
+    (void)gesture;
+    (void)n_press;
+    LockSurface *surface = user_data;
+    NintyBar *bar = surface->bar;
+    if (!bar->locked || bar->lock_authenticating) {
+        return;
+    }
+    int width = gtk_widget_get_width(surface->area);
+    int height = gtk_widget_get_height(surface->area);
+    double bx = 0;
+    double by = 0;
+    double bw = 0;
+    double bh = 0;
+    lock_button_rect(width, height, &bx, &by, &bw, &bh);
+    if (rect_contains(x, y, bx, by, bw, bh)) {
+        lock_submit(bar);
+    }
+}
+
+static void lock_surface_free(LockSurface *surface) {
+    g_free(surface);
+}
+
+static void create_lock_surface(NintyBar *bar, GdkMonitor *monitor,
+                                gboolean interactive) {
+    LockSurface *surface = g_new0(LockSurface, 1);
+    surface->bar = bar;
+    surface->interactive = interactive;
+
+    GdkRectangle geometry = { 0 };
+    if (monitor != NULL) {
+        gdk_monitor_get_geometry(monitor, &geometry);
+    }
+
+    GtkWidget *window = gtk_application_window_new(bar->app);
+    gtk_widget_add_css_class(window, "nintysh");
+    gtk_window_set_title(GTK_WINDOW(window), "nintysh-lock");
+    gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(window),
+                                geometry.width > 0 ? geometry.width : 1,
+                                geometry.height > 0 ? geometry.height : 1);
+
+    gtk_layer_init_for_window(GTK_WINDOW(window));
+    gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-lock");
+    gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_OVERLAY);
+    if (monitor != NULL) {
+        gtk_layer_set_monitor(GTK_WINDOW(window), monitor);
+    }
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP, TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                         TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
+                         TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
+                         TRUE);
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
+    gtk_layer_set_keyboard_mode(
+        GTK_WINDOW(window), interactive
+                                ? GTK_LAYER_SHELL_KEYBOARD_MODE_EXCLUSIVE
+                                : GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+
+    surface->window = window;
+    surface->area = gtk_drawing_area_new();
+    gtk_widget_set_hexpand(surface->area, TRUE);
+    gtk_widget_set_vexpand(surface->area, TRUE);
+    gtk_widget_set_focusable(surface->area, TRUE);
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(surface->area),
+                                   lock_surface_draw, surface, NULL);
+    gtk_window_set_child(GTK_WINDOW(window), surface->area);
+
+    if (interactive) {
+        GtkGesture *click = gtk_gesture_click_new();
+        gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 1);
+        g_signal_connect(click, "pressed", G_CALLBACK(lock_clicked),
+                         surface);
+        gtk_widget_add_controller(surface->area,
+                                  GTK_EVENT_CONTROLLER(click));
+
+        GtkEventController *keys = gtk_event_controller_key_new();
+        g_signal_connect(keys, "key-pressed", G_CALLBACK(lock_key_pressed),
+                         bar);
+        gtk_widget_add_controller(window, keys);
+    }
+
+    gtk_window_present(GTK_WINDOW(window));
+    g_ptr_array_add(bar->lock_surfaces, surface);
+    if (interactive) {
+        bar->lock_window = window;
+        bar->lock_area = surface->area;
+    }
+}
+
+static void ninty_lock_screen(NintyBar *bar) {
+    if (bar->locked) {
+        return;
+    }
+    close_menu(bar);
+    close_panel(bar);
+
+    bar->locked = TRUE;
+    bar->lock_authenticating = FALSE;
+    g_free(bar->lock_password);
+    bar->lock_password = g_strdup("");
+    bar->lock_message[0] = '\0';
+
+    GListModel *monitors =
+        gdk_display_get_monitors(gdk_display_get_default());
+    guint count = monitors != NULL ? g_list_model_get_n_items(monitors) : 0;
+    g_ptr_array_set_size(bar->lock_surfaces, 0);
+    if (count == 0) {
+        create_lock_surface(bar, NULL, TRUE);
+    } else {
+        for (guint i = 0; i < count; i++) {
+            GdkMonitor *monitor = g_list_model_get_item(monitors, i);
+            create_lock_surface(bar, monitor, i == 0);
+            g_object_unref(monitor);
+        }
+    }
+
+    if (bar->lock_area != NULL) {
+        gtk_widget_grab_focus(bar->lock_area);
     }
 }
 
@@ -3528,7 +5456,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     int layout_w = (layout_name != NULL && layout_name[0] != '\0')
                        ? MAX(20, win98_text_width(layout_name, TRUE) + 8)
                        : 0;
-    double tray_w = 4.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 +
+    double tray_w = 4.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 +
                     (bar->battery_available ? 20.0 : 0.0) + layout_w + 4.0 +
                     clock_w + 4.0;
     double tray_x = w - 2.0 - tray_w;
@@ -3660,6 +5588,10 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     bar_add_hit(bar, HIT_MEDIA, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
+    win98_draw_session_icon(cr, icon_x, icon_y);
+    bar_add_hit(bar, HIT_SESSION, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
+    icon_x += 20.0;
+
     if (layout_w > 0) {
         win98_draw_text(cr, icon_x, y + 2.0, layout_w, button_h - 4.0,
                    layout_name, WIN98_ALIGN_CENTER, TRUE, win98_text, FALSE);
@@ -3682,7 +5614,8 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     (void)n_press;
     BarSurface *surface = user_data;
     NintyBar *bar = surface->bar;
-    BarHit *hit = bar_hit_at(surface->hits, x, y);
+    double scale = bar_scale();
+    BarHit *hit = bar_hit_at(surface->hits, x / scale, y / scale);
     if (hit == NULL) {
         return;
     }
@@ -3725,6 +5658,9 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     case HIT_MEDIA:
         open_panel(bar, PANEL_MEDIA);
         break;
+    case HIT_SESSION:
+        open_panel(bar, PANEL_SESSION);
+        break;
     default:
         break;
     }
@@ -3736,13 +5672,14 @@ static void bar_right_clicked(GtkGestureClick *gesture, int n_press,
     (void)n_press;
     BarSurface *surface = user_data;
     NintyBar *bar = surface->bar;
-    BarHit *hit = bar_hit_at(surface->hits, x, y);
+    double scale = bar_scale();
+    BarHit *hit = bar_hit_at(surface->hits, x / scale, y / scale);
     if (hit == NULL) {
         return;
     }
 
     if (hit->kind == HIT_WINDOW) {
-        open_task_menu(bar, hit->value, x);
+        open_task_menu(bar, hit->value, x / panel_scale());
     } else if (hit->kind == HIT_VOLUME) {
         toggle_volume(bar);
     } else if (hit->kind == HIT_MEDIA) {
@@ -3770,6 +5707,9 @@ static gboolean bar_slow_tick(gpointer user_data) {
     changed |= update_audio_devices(bar);
     changed |= update_battery(bar);
     changed |= update_network(bar);
+    if (bar->panel_kind == PANEL_NETWORK) {
+        update_wifi(bar);
+    }
     if (changed) {
         bar_queue_redraw(bar);
         if (bar->panel_kind != PANEL_NONE) {
@@ -3843,7 +5783,7 @@ static void create_bar_surface(NintyBar *bar, GdkMonitor *monitor) {
     gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
     gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
     gtk_window_set_default_size(GTK_WINDOW(window), geometry.width,
-                                BAR_HEIGHT);
+                                (int)round(bar_height_px()));
 
     gtk_layer_init_for_window(GTK_WINDOW(window));
     gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-bar");
@@ -3856,13 +5796,13 @@ static void create_bar_surface(NintyBar *bar, GdkMonitor *monitor) {
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
                          TRUE);
-    gtk_layer_set_exclusive_zone(GTK_WINDOW(window), BAR_HEIGHT);
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(window), (int)round(bar_height_px()));
     gtk_layer_set_keyboard_mode(GTK_WINDOW(window),
                                 GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
 
     surface->window = window;
     surface->area = gtk_drawing_area_new();
-    gtk_widget_set_size_request(surface->area, -1, BAR_HEIGHT);
+    gtk_widget_set_size_request(surface->area, -1, (int)round(bar_height_px()));
     gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(surface->area),
                                    bar_surface_draw, surface, NULL);
     gtk_window_set_child(GTK_WINDOW(window), surface->area);
@@ -4400,6 +6340,10 @@ static PanelKind panel_kind_from_name(const char *name) {
         g_strcmp0(name, "mpris") == 0) {
         return PANEL_MEDIA;
     }
+    if (g_strcmp0(name, "session") == 0 ||
+        g_strcmp0(name, "power-menu") == 0) {
+        return PANEL_SESSION;
+    }
     return PANEL_NONE;
 }
 
@@ -4437,6 +6381,18 @@ static void open_named_panel(NintyBar *bar, const char *name) {
     }
 }
 
+static int percent_argument(const char *argument) {
+    if (argument == NULL || argument[0] == '\0') {
+        return -1;
+    }
+    double value = g_ascii_strtod(argument, NULL);
+    if (strchr(argument, '%') == NULL && strchr(argument, '.') != NULL &&
+        value <= 1.5) {
+        value *= 100.0;
+    }
+    return CLAMP((int)round(value), 0, 150);
+}
+
 static char *join_command_args(gchar **parts, int start, int count) {
     if (start >= count) {
         return g_strdup("");
@@ -4447,6 +6403,53 @@ static char *join_command_args(gchar **parts, int start, int count) {
         g_string_append(text, parts[i]);
     }
     return g_string_free(text, FALSE);
+}
+
+static WifiNetwork *wifi_find_network(NintyBar *bar, const char *ssid) {
+    for (guint i = 0; i < bar->wifi_networks->len; i++) {
+        WifiNetwork *network = g_ptr_array_index(bar->wifi_networks, i);
+        if (g_strcmp0(network->ssid, ssid) == 0) {
+            return network;
+        }
+    }
+    return NULL;
+}
+
+static void command_network(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    if (action == NULL || g_strcmp0(action, "open") == 0 ||
+        g_strcmp0(action, "list") == 0) {
+        open_panel(bar, PANEL_NETWORK);
+        return;
+    }
+    if (g_strcmp0(action, "scan") == 0) {
+        network_scan(bar);
+        return;
+    }
+    if (g_strcmp0(action, "disconnect") == 0) {
+        network_disconnect(bar);
+        return;
+    }
+    if (g_strcmp0(action, "refresh") == 0) {
+        update_wifi(bar);
+        return;
+    }
+    if (g_strcmp0(action, "connect") == 0 && count > 2) {
+        char *ssid = join_command_args(parts, 2, count);
+        open_panel(bar, PANEL_NETWORK);
+        WifiNetwork *network = wifi_find_network(bar, ssid);
+        if (network != NULL && network->active) {
+            network_disconnect(bar);
+        } else if (network != NULL && network->security != NULL &&
+                   network->security[0] != '\0' && !network->saved) {
+            network_password_begin(bar, ssid);
+        } else {
+            network_connect(bar, ssid);
+        }
+        g_free(ssid);
+        return;
+    }
+    open_panel(bar, PANEL_NETWORK);
 }
 
 static int audio_default_index(GPtrArray *devices) {
@@ -4835,8 +6838,29 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
                g_strcmp0(verb, "start") == 0) {
         command_launcher(bar, parts, count);
     } else if (g_strcmp0(verb, "session") == 0) {
-        if (arg == NULL || g_strcmp0(arg, "lock") == 0) {
+        if (arg == NULL || g_strcmp0(arg, "menu") == 0) {
+            open_panel(bar, PANEL_SESSION);
+        } else if (g_strcmp0(arg, "toggle") == 0) {
+            toggle_named_panel(bar, "session");
+        } else if (g_strcmp0(arg, "lock") == 0) {
+            ninty_lock_screen(bar);
+        } else if (g_strcmp0(arg, "lock-external") == 0) {
             run_shell_command(NINTYSH_LOCK_COMMAND);
+        } else if (g_strcmp0(arg, "suspend") == 0) {
+            run_shell_command(NINTYSH_SUSPEND_COMMAND);
+        } else if (g_strcmp0(arg, "lock-and-suspend") == 0) {
+            ninty_lock_screen(bar);
+            run_shell_command(NINTYSH_SUSPEND_COMMAND);
+        } else if (g_strcmp0(arg, "reboot-uefi") == 0) {
+            run_shell_command("systemctl reboot --firmware-setup");
+        } else if (g_strcmp0(arg, "logout") == 0 ||
+                   g_strcmp0(arg, "log-out") == 0) {
+            run_shell_command(NINTYSH_LOGOUT_COMMAND);
+        } else if (g_strcmp0(arg, "reboot") == 0) {
+            run_shell_command(NINTYSH_REBOOT_COMMAND);
+        } else if (g_strcmp0(arg, "shutdown") == 0 ||
+                   g_strcmp0(arg, "poweroff") == 0) {
+            run_shell_command(NINTYSH_SHUTDOWN_COMMAND);
         }
     } else if (g_strcmp0(verb, "brightness") == 0) {
         if (arg == NULL || g_strcmp0(arg, "up") == 0) {
@@ -4894,7 +6918,7 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
                g_strcmp0(verb, "clock") == 0) {
         open_panel(bar, PANEL_CALENDAR);
     } else if (g_strcmp0(verb, "network") == 0) {
-        open_panel(bar, PANEL_NETWORK);
+        command_network(bar, parts, count);
     } else if (g_strcmp0(verb, "clipboard") == 0) {
         open_panel(bar, PANEL_CLIPBOARD);
     } else if (g_strcmp0(verb, "notifications-toggle") == 0 ||
@@ -4910,6 +6934,64 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
                g_strcmp0(verb, "settings-toggle") == 0 ||
                g_strcmp0(verb, "settings") == 0) {
         toggle_named_panel(bar, "audio");
+    } else if (g_strcmp0(verb, "volume-set") == 0 && arg != NULL) {
+        int percent = percent_argument(arg);
+        if (percent >= 0) {
+            apply_volume(bar, percent, TRUE);
+        }
+    } else if (g_strcmp0(verb, "volume-osd") == 0) {
+        if (arg != NULL) {
+            char text[64];
+            g_snprintf(text, sizeof(text), "Volume %d%%",
+                       percent_argument(arg));
+            osd_show_text(bar, text);
+        } else {
+            osd_show_volume(bar);
+        }
+    } else if (g_strcmp0(verb, "mic-volume-set") == 0 && arg != NULL) {
+        int percent = percent_argument(arg);
+        if (percent >= 0) {
+            apply_source_volume(bar, percent, TRUE);
+        }
+    } else if (g_strcmp0(verb, "mic-volume-up") == 0) {
+        int step = arg != NULL ? percent_argument(arg) : NINTYSH_AUDIO_STEP;
+        apply_source_volume(bar, bar->source_percent +
+                                     (step >= 0 ? step : NINTYSH_AUDIO_STEP),
+                            TRUE);
+    } else if (g_strcmp0(verb, "mic-volume-down") == 0) {
+        int step = arg != NULL ? percent_argument(arg) : NINTYSH_AUDIO_STEP;
+        apply_source_volume(bar, bar->source_percent -
+                                     (step >= 0 ? step : NINTYSH_AUDIO_STEP),
+                            TRUE);
+    } else if (g_strcmp0(verb, "mic-volume-osd") == 0) {
+        char text[64];
+        g_snprintf(text, sizeof(text), "Microphone %d%%",
+                   arg != NULL ? percent_argument(arg)
+                               : bar->source_percent);
+        osd_show_text(bar, text);
+    } else if (g_strcmp0(verb, "wifi-enable") == 0) {
+        network_set_wifi(bar, TRUE);
+    } else if (g_strcmp0(verb, "wifi-disable") == 0) {
+        network_set_wifi(bar, FALSE);
+    } else if (g_strcmp0(verb, "wifi-toggle") == 0) {
+        network_toggle_wifi(bar);
+    } else if (g_strcmp0(verb, "wifi-status") == 0) {
+        osd_show_text(bar, bar->wifi_enabled ? "Wi-Fi on" : "Wi-Fi off");
+    } else if (g_strcmp0(verb, "notification-clear-active") == 0 ||
+               g_strcmp0(verb, "notification-clear-history") == 0) {
+        notifications_clear(bar);
+    } else if (g_strcmp0(verb, "clipboard-clear") == 0) {
+        clipboard_clear_history(bar);
+    } else if (g_strcmp0(verb, "clipboard-copy") == 0) {
+        const char *text = strchr(command, ' ');
+        clipboard_copy_text(bar, text != NULL ? text + 1 : "");
+    } else if (g_strcmp0(verb, "settings-open") == 0) {
+        open_panel(bar, PANEL_VOLUME);
+    } else if (g_strcmp0(verb, "settings-close") == 0) {
+        close_panel(bar);
+    } else if (g_strcmp0(verb, "osd-show") == 0) {
+        const char *text = strchr(command, ' ');
+        osd_show_text(bar, text != NULL ? text + 1 : "");
     } else if (g_strcmp0(verb, "volume") == 0) {
         if (count == 1) {
             open_panel(bar, PANEL_VOLUME);
@@ -4926,9 +7008,15 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
             apply_volume(bar, atoi(arg), TRUE);
         }
     } else if (g_strcmp0(verb, "volume-up") == 0) {
-        apply_volume(bar, bar->volume_percent + NINTYSH_AUDIO_STEP, TRUE);
+        int step = arg != NULL ? percent_argument(arg) : NINTYSH_AUDIO_STEP;
+        apply_volume(bar, bar->volume_percent +
+                              (step >= 0 ? step : NINTYSH_AUDIO_STEP),
+                     TRUE);
     } else if (g_strcmp0(verb, "volume-down") == 0) {
-        apply_volume(bar, bar->volume_percent - NINTYSH_AUDIO_STEP, TRUE);
+        int step = arg != NULL ? percent_argument(arg) : NINTYSH_AUDIO_STEP;
+        apply_volume(bar, bar->volume_percent -
+                              (step >= 0 ? step : NINTYSH_AUDIO_STEP),
+                     TRUE);
     } else if (g_strcmp0(verb, "volume-mute") == 0 ||
                g_strcmp0(verb, "volume-toggle") == 0) {
         toggle_volume(bar);
@@ -4961,7 +7049,7 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         toggle_source(bar);
     } else if (g_strcmp0(verb, "session-lock") == 0 ||
                g_strcmp0(verb, "lock") == 0) {
-        run_shell_command(NINTYSH_LOCK_COMMAND);
+        ninty_lock_screen(bar);
     } else if (g_strcmp0(verb, "brightness-up") == 0) {
         run_shell_command(NINTYSH_BRIGHTNESS_UP_COMMAND);
     } else if (g_strcmp0(verb, "brightness-down") == 0) {
@@ -4986,18 +7074,25 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->apps = g_ptr_array_new_with_free_func(g_object_unref);
     bar->menu_results = g_ptr_array_new();
     bar->menu_query = g_strdup("");
-    bar->clipboard_history =
-        g_ptr_array_new_with_free_func((GDestroyNotify)g_free);
+    bar->clipboard_history = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)clipboard_entry_free);
+    bar->clipboard_matches =
+        g_array_new(FALSE, FALSE, sizeof(guint));
+    bar->clipboard_query = g_strdup("");
     bar->audio_sinks =
         g_ptr_array_new_with_free_func((GDestroyNotify)audio_device_free);
     bar->audio_sources =
         g_ptr_array_new_with_free_func((GDestroyNotify)audio_device_free);
     bar->notifications = g_ptr_array_new_with_free_func(
         (GDestroyNotify)notification_free);
+    bar->wifi_networks = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)wifi_network_free);
     bar->popup_hits = g_ptr_array_new_with_free_func(
         (GDestroyNotify)notification_popup_hit_free);
     bar->surfaces = g_ptr_array_new_with_free_func(
         (GDestroyNotify)bar_surface_free);
+    bar->lock_surfaces = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)lock_surface_free);
     bar->icon_cache = g_hash_table_new_full(
         g_str_hash, g_str_equal, g_free, g_object_unref);
     bar->app_index = g_hash_table_new_full(g_str_hash, g_str_equal, g_free,
@@ -5106,13 +7201,22 @@ void ninty_bar_free(NintyBar *bar) {
     g_ptr_array_unref(bar->apps);
     g_ptr_array_unref(bar->menu_results);
     g_ptr_array_unref(bar->clipboard_history);
+    g_array_unref(bar->clipboard_matches);
+    g_free(bar->clipboard_query);
     g_ptr_array_unref(bar->audio_sinks);
     g_ptr_array_unref(bar->audio_sources);
     g_ptr_array_unref(bar->notifications);
+    g_ptr_array_unref(bar->wifi_networks);
     g_ptr_array_unref(bar->popup_hits);
-    g_free(bar->last_clipboard);
+    g_free(bar->network_active_connection);
+    g_free(bar->network_active_device);
+    g_free(bar->network_password_ssid);
+    g_free(bar->network_password);
+    g_free(bar->last_clipboard_hash);
     g_free(bar->menu_query);
     g_ptr_array_unref(bar->surfaces);
+    g_ptr_array_unref(bar->lock_surfaces);
+    g_free(bar->lock_password);
     g_hash_table_destroy(bar->icon_cache);
     g_object_unref(bar->icon_theme);
     g_free(bar);

@@ -11,6 +11,8 @@
   brightnessctl,
   grim,
   slurp,
+  networkmanager,
+  pam,
   extraConfig ? "",
   wrapperArgs ? [ ],
 }:
@@ -36,6 +38,7 @@ stdenv.mkDerivation {
     gtk4
     gtk4-layer-shell
     json-glib
+    pam
   ];
 
   postPatch = lib.optionalString (extraConfig != "") ''
@@ -46,7 +49,7 @@ stdenv.mkDerivation {
 
   gappsWrapperArgs = [
     "--prefix" "PATH" ":"
-    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp ])
+    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp networkmanager ])
   ] ++ wrapperArgs;
 
   buildPhase = ''

@@ -76,10 +76,24 @@ static PangoLayout *create_layout(cairo_t *cr, const char *text,
 }
 
 static void set_pixel_font_options(cairo_t *cr) {
+    cairo_matrix_t matrix;
+    cairo_get_matrix(cr, &matrix);
+    double scale = sqrt(fabs(matrix.xx * matrix.yy -
+                             matrix.xy * matrix.yx));
+    gboolean scaled = fabs(scale - 1.0) > 0.01;
+
     cairo_font_options_t *options = cairo_font_options_create();
-    cairo_font_options_set_antialias(options, CAIRO_ANTIALIAS_NONE);
-    cairo_font_options_set_hint_style(options, CAIRO_HINT_STYLE_FULL);
-    cairo_font_options_set_hint_metrics(options, CAIRO_HINT_METRICS_ON);
+    if (scaled) {
+        cairo_font_options_set_antialias(options, CAIRO_ANTIALIAS_GRAY);
+        cairo_font_options_set_hint_style(options, CAIRO_HINT_STYLE_SLIGHT);
+        cairo_font_options_set_hint_metrics(options,
+                                            CAIRO_HINT_METRICS_OFF);
+    } else {
+        cairo_font_options_set_antialias(options, CAIRO_ANTIALIAS_NONE);
+        cairo_font_options_set_hint_style(options, CAIRO_HINT_STYLE_FULL);
+        cairo_font_options_set_hint_metrics(options,
+                                            CAIRO_HINT_METRICS_ON);
+    }
     cairo_set_font_options(cr, options);
     cairo_font_options_destroy(options);
 }
@@ -351,6 +365,23 @@ void win98_draw_media_icon(cairo_t *cr, double x, double y,
     if (playing) {
         win98_fill(cr, 11, 10, 4, 4, win98_green);
     }
+
+    cairo_restore(cr);
+}
+
+void win98_draw_session_icon(cairo_t *cr, double x, double y) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    win98_fill(cr, 1, 1, 14, 14, win98_face);
+    win98_bevel(cr, 1, 1, 14, 14, WIN98_BEVEL_RAISED);
+
+    cairo_set_source_rgb(cr, win98_red.r, win98_red.g, win98_red.b);
+    cairo_set_line_width(cr, 2.0);
+    cairo_arc(cr, 8.0, 8.5, 4.5, -M_PI_2 + 0.65, 3 * M_PI_2 - 0.65);
+    cairo_stroke(cr);
+
+    win98_fill(cr, 7, 3, 2, 6, win98_red);
 
     cairo_restore(cr);
 }

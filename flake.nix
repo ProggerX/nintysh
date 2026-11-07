@@ -38,6 +38,8 @@
               brightnessctl
               grim
               slurp
+              networkmanager
+              pam
             ];
           };
 

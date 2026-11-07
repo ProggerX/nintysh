@@ -27,8 +27,10 @@ No support. No guarantees. It works on my machine.
 - Linux with Wayland
 - niri
 - GTK4 + gtk4-layer-shell
-- `wl-clipboard` for clipboard history
+- `wl-clipboard` for text and image clipboard history
 - `wpctl` for audio output, microphone and default-device control
+- NetworkManager (`nmcli`) for the Wi-Fi network panel
+- PAM for the built-in lock screen
 - `brightnessctl`, `grim`, `slurp` and `loginctl` for the optional IPC actions
 - a system battery exposed through `/sys/class/power_supply` for the battery widget
 
@@ -64,10 +66,16 @@ The shell is a layer-shell client. Start it inside a running niri session.
   popup cards, optional images (app icon, `image-path`, `image-data`), action
   buttons, notification history, and a tray icon
 - MPRIS media panel with album art, progress/seek, play/pause, previous and
-  next controls, plus tray and IPC control
+  next controls, player selection, plus tray and IPC control
 - Calendar panel
-- Network and battery information panels
-- Clipboard history panel with click-to-copy
+- NetworkManager network panel with Wi-Fi toggle, scanning, active connection
+  info, signal/security list, saved/open connections and a password prompt for
+  new secured networks
+- Battery information panel
+- Clipboard history panel with text and image entries, thumbnails, search,
+  arrow-key navigation and click/Enter-to-copy
+- Built-in PAM lock screen covering every monitor
+- Session menu with lock, suspend, log out, reboot and shut down actions
 - Right-click task menu: focus, floating, fullscreen, close
 - Per-monitor taskbars
 - Multi-monitor window/workspace filtering
@@ -99,7 +107,7 @@ nintysh msg panel toggle notifications
 ```
 
 Panel names: `launcher`, `audio`, `media`, `clipboard`, `calendar`,
-`network`, `power`, `notifications`.
+`network`, `power`, `notifications`, `session`.
 
 Audio output and microphone:
 
@@ -134,6 +142,16 @@ nintysh msg notifications dismiss all
 nintysh msg notifications clear
 ```
 
+Network:
+
+```bash
+nintysh msg network open
+nintysh msg network scan
+nintysh msg network connect "OPPO A78"
+nintysh msg network disconnect
+nintysh msg network refresh
+```
+
 Media / MPRIS:
 
 ```bash
@@ -149,13 +167,27 @@ nintysh msg media position 60
 ```
 
 The media panel follows the currently playing MPRIS player, preferring a
-player whose status is `Playing`. Local album art (`file://` or an absolute
-path) is rendered; remote artwork URLs are ignored.
+player whose status is `Playing`. Use the player list at the bottom of the
+panel to pin a different player; the choice is kept while that player remains
+available. Local album art (`file://` or an absolute path) is rendered; remote
+artwork URLs are ignored.
+
+Session menu and actions:
+
+```bash
+nintysh msg session
+nintysh msg session toggle
+nintysh msg panel toggle session
+nintysh msg session lock
+nintysh msg session suspend
+nintysh msg session logout
+nintysh msg session reboot
+nintysh msg session shutdown
+```
 
 Desktop actions:
 
 ```bash
-nintysh msg session lock
 nintysh msg brightness up
 nintysh msg brightness down
 nintysh msg screenshot region
@@ -182,6 +214,36 @@ Niri binds can use these directly:
 The old flat verbs (`panel-toggle`, `volume-up`, `mic-up`, `settings-toggle`,
 `screenshot-region`, etc.) are still accepted as compatibility aliases.
 
+### Noctalia compatibility
+
+Most Noctalia keybind commands work unchanged after replacing `noctalia` with
+`nintysh`:
+
+```bash
+nintysh msg panel-toggle launcher
+nintysh msg panel-toggle control-center
+nintysh msg panel-toggle clipboard
+nintysh msg settings-toggle
+nintysh msg session lock
+nintysh msg volume-up
+nintysh msg volume-down
+nintysh msg volume-mute
+nintysh msg brightness-up
+nintysh msg brightness-down
+nintysh msg screenshot-region
+nintysh msg screenshot-fullscreen
+```
+
+Additional compatibility aliases include `settings-open`, `settings-close`,
+`session lock-and-suspend`, `volume-set`, `volume-osd`, `mic-volume-*`,
+`wifi-enable`, `wifi-disable`, `wifi-toggle`, `media play|pause|toggle|next|previous`,
+`clipboard-clear`, `clipboard-copy`, `notification-clear-active`,
+`notification-clear-history`, and `osd-show`.
+
+Commands that print state to stdout, such as `volume-osd` returning values or
+`wifi-status`, cannot act as a full request/response replacement because the
+nintysh IPC socket has no reply channel; they still perform their UI action.
+
 ### Configuration
 
 Compile-time settings live in:
@@ -195,12 +257,16 @@ Example `config.user.h`:
 
 ```c
 #define NINTYSH_BAR_HEIGHT 30
+#define NINTYSH_BAR_SCALE 1.0
+#define NINTYSH_PANEL_SCALE 1.0
 #define NINTYSH_FONT_FAMILY "Tahoma"
 #define NINTYSH_FONT_PX 12
 #define NINTYSH_COLOR_FACE 0xC0C0C0
 #define NINTYSH_COLOR_NAVY 0x000080
 #define NINTYSH_ICON_SIZE 24
 #define NINTYSH_CLIPBOARD_MAX_ENTRIES 50
+#define NINTYSH_CLIPBOARD_ROW_HEIGHT 34.0
+#define NINTYSH_CLIPBOARD_IMAGE_MAX_BYTES (8 * 1024 * 1024)
 #define NINTYSH_AUDIO_STEP 5
 #define NINTYSH_NOTIFICATION_MAX_ENTRIES 50
 #define NINTYSH_NOTIFICATION_POPUP_WIDTH 380
@@ -213,9 +279,9 @@ Example `config.user.h`:
 #define NINTYSH_SCREENSHOT_FULLSCREEN_COMMAND "grim - | wl-copy"
 ```
 
-Configurable groups include font, bar geometry, launcher geometry, icons, OSD,
-clipboard, audio, notifications, update intervals, IPC action commands and
-Win98 colors.
+Configurable groups include font, bar geometry and scale, panel scale, launcher
+geometry, icons, OSD, clipboard, audio, notifications, update intervals, IPC
+action commands and Win98 colors.
 
 ### Nix package helpers
 
@@ -263,10 +329,14 @@ Example:
 
     settings = {
       bar.height = 30;
+      bar.scale = 1.0;
+      panels.scale = 1.0;
       font.size = 12;
       launcher.width = 280;
       icons.size = 24;
       clipboard.maxEntries = 50;
+      clipboard.rowHeight = 34.0;
+      clipboard.imageMaxBytes = 8388608;
       audio.step = 5;
       notifications.maxEntries = 50;
       notifications.timeoutMs = 6000;
@@ -298,5 +368,6 @@ The module installs the package and, with `autostart`, creates a systemd user se
 - window icon matching is heuristic
 - media control depends on MPRIS; remote album-art URLs are not downloaded
 - audio control and default-device switching depend on `wpctl`/PipeWire
+- the Wi-Fi panel uses `nmcli`; new secured networks prompt for a password
 - `settings-toggle` opens the audio panel; there is no separate settings UI
 

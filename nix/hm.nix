@@ -15,6 +15,8 @@ let
       "#define NINTYSH_FONT_FAMILY ${builtins.toJSON settings.font.family}"
       "#define NINTYSH_FONT_PX ${toString settings.font.size}"
       "#define NINTYSH_BAR_HEIGHT ${toString settings.bar.height}"
+      "#define NINTYSH_BAR_SCALE ${toString settings.bar.scale}"
+      "#define NINTYSH_PANEL_SCALE ${toString settings.panels.scale}"
       "#define NINTYSH_BUTTON_Y ${toString settings.bar.buttonY}"
       "#define NINTYSH_BUTTON_HEIGHT ${toString settings.bar.buttonHeight}"
       "#define NINTYSH_MENU_WIDTH ${toString settings.launcher.width}"
@@ -30,6 +32,7 @@ let
       "#define NINTYSH_OSD_TIMEOUT_MS ${toString settings.osd.timeoutMs}"
       "#define NINTYSH_CLIPBOARD_MAX_ENTRIES ${toString settings.clipboard.maxEntries}"
       "#define NINTYSH_CLIPBOARD_MAX_BYTES ${toString settings.clipboard.maxBytes}"
+      "#define NINTYSH_CLIPBOARD_IMAGE_MAX_BYTES ${toString settings.clipboard.imageMaxBytes}"
       "#define NINTYSH_CLIPBOARD_POLL_SECONDS ${toString settings.clipboard.pollSeconds}"
       "#define NINTYSH_CLIPBOARD_ROW_HEIGHT ${toString settings.clipboard.rowHeight}"
       "#define NINTYSH_AUDIO_STEP ${toString settings.audio.step}"
@@ -41,6 +44,10 @@ let
       "#define NINTYSH_NOTIFICATION_POPUP_MAX ${toString settings.notifications.popupMax}"
       "#define NINTYSH_NOTIFICATION_POPUP_MARGIN ${toString settings.notifications.popupMargin}"
       "#define NINTYSH_LOCK_COMMAND ${builtins.toJSON settings.commands.lock}"
+      "#define NINTYSH_LOGOUT_COMMAND ${builtins.toJSON settings.commands.logout}"
+      "#define NINTYSH_SUSPEND_COMMAND ${builtins.toJSON settings.commands.suspend}"
+      "#define NINTYSH_REBOOT_COMMAND ${builtins.toJSON settings.commands.reboot}"
+      "#define NINTYSH_SHUTDOWN_COMMAND ${builtins.toJSON settings.commands.shutdown}"
       "#define NINTYSH_BRIGHTNESS_UP_COMMAND ${builtins.toJSON settings.commands.brightnessUp}"
       "#define NINTYSH_BRIGHTNESS_DOWN_COMMAND ${builtins.toJSON settings.commands.brightnessDown}"
       "#define NINTYSH_SCREENSHOT_REGION_COMMAND ${builtins.toJSON settings.commands.screenshotRegion}"
@@ -118,6 +125,11 @@ in
               default = 28;
               description = "Taskbar height in pixels.";
             };
+            scale = lib.mkOption {
+              type = lib.types.number;
+              default = 1.0;
+              description = "Taskbar scaling factor.";
+            };
             buttonY = lib.mkOption {
               type = lib.types.number;
               default = 3.0;
@@ -127,6 +139,14 @@ in
               type = lib.types.number;
               default = 22.0;
               description = "Taskbar button height.";
+            };
+          };
+
+          panels = {
+            scale = lib.mkOption {
+              type = lib.types.number;
+              default = 1.0;
+              description = "Scaling factor for dropdown panels.";
             };
           };
 
@@ -208,7 +228,12 @@ in
             maxBytes = lib.mkOption {
               type = lib.types.ints.positive;
               default = 65536;
-              description = "Maximum bytes stored per clipboard entry.";
+              description = "Maximum bytes stored per text clipboard entry.";
+            };
+            imageMaxBytes = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 8388608;
+              description = "Maximum bytes stored per image clipboard entry.";
             };
             pollSeconds = lib.mkOption {
               type = lib.types.ints.positive;
@@ -217,7 +242,7 @@ in
             };
             rowHeight = lib.mkOption {
               type = lib.types.number;
-              default = 20.0;
+              default = 34.0;
               description = "Clipboard row height.";
             };
           };
@@ -272,7 +297,27 @@ in
             lock = lib.mkOption {
               type = lib.types.str;
               default = "loginctl lock-session";
-              description = "Command run by `nintysh msg session-lock`.";
+              description = "External lock command used by `nintysh msg session lock-external`.";
+            };
+            logout = lib.mkOption {
+              type = lib.types.str;
+              default = "loginctl terminate-session \"$XDG_SESSION_ID\"";
+              description = "Command run by the session menu's log out item.";
+            };
+            suspend = lib.mkOption {
+              type = lib.types.str;
+              default = "systemctl suspend";
+              description = "Command run by the session menu's suspend item.";
+            };
+            reboot = lib.mkOption {
+              type = lib.types.str;
+              default = "systemctl reboot";
+              description = "Command run by the session menu's reboot item.";
+            };
+            shutdown = lib.mkOption {
+              type = lib.types.str;
+              default = "systemctl poweroff";
+              description = "Command run by the session menu's shut down item.";
             };
             brightnessUp = lib.mkOption {
               type = lib.types.str;

@@ -12,9 +12,21 @@
 struct MprisClient {
     GDBusConnection *connection;
     MprisState state;
+    GPtrArray *players;
+    char *preferred;
     MprisChangedFunc changed;
     gpointer user_data;
 };
+
+static void player_info_free(MprisPlayerInfo *info) {
+    if (info == NULL) {
+        return;
+    }
+    g_free((char *)info->bus_name);
+    g_free((char *)info->identity);
+    g_free((char *)info->status);
+    g_free(info);
+}
 
 static void state_clear(MprisState *state) {
     g_free(state->player);
@@ -140,12 +152,16 @@ static char *metadata_track_id(GVariant *metadata) {
     if (metadata == NULL) {
         return NULL;
     }
-    GVariant *value = g_variant_lookup_value(
-        metadata, "mpris:trackid", G_VARIANT_TYPE_OBJECT_PATH);
+    GVariant *value =
+        g_variant_lookup_value(metadata, "mpris:trackid", NULL);
     if (value == NULL) {
         return NULL;
     }
-    char *track_id = g_variant_dup_string(value, NULL);
+    char *track_id = NULL;
+    if (g_variant_is_of_type(value, G_VARIANT_TYPE_OBJECT_PATH) ||
+        g_variant_is_of_type(value, G_VARIANT_TYPE_STRING)) {
+        track_id = g_variant_dup_string(value, NULL);
+    }
     g_variant_unref(value);
     return track_id;
 }
@@ -243,6 +259,18 @@ static char *player_status(MprisClient *client, const char *bus_name) {
     return status;
 }
 
+static char *player_identity(MprisClient *client, const char *bus_name) {
+    GVariant *root = get_all(client, bus_name, MPRIS_ROOT);
+    char *identity = dict_dup_string(root, "Identity");
+    if (root != NULL) {
+        g_variant_unref(root);
+    }
+    if (identity == NULL) {
+        identity = g_strdup(bus_name + strlen(MPRIS_PREFIX));
+    }
+    return identity;
+}
+
 static gboolean state_equal(const MprisState *a, const MprisState *b) {
     return a->available == b->available &&
            g_strcmp0(a->player, b->player) == 0 &&
@@ -269,6 +297,8 @@ MprisClient *mpris_client_new(MprisChangedFunc changed,
     MprisClient *client = g_new0(MprisClient, 1);
     client->changed = changed;
     client->user_data = user_data;
+    client->players =
+        g_ptr_array_new_with_free_func((GDestroyNotify)player_info_free);
 
     GError *error = NULL;
     client->connection =
@@ -284,10 +314,30 @@ void mpris_client_free(MprisClient *client) {
         return;
     }
     state_clear(&client->state);
+    if (client->players != NULL) {
+        g_ptr_array_unref(client->players);
+    }
+    g_free(client->preferred);
     if (client->connection != NULL) {
         g_object_unref(client->connection);
     }
     g_free(client);
+}
+
+static gboolean players_equal(GPtrArray *a, GPtrArray *b) {
+    if (a->len != b->len) {
+        return FALSE;
+    }
+    for (guint i = 0; i < a->len; i++) {
+        MprisPlayerInfo *pa = g_ptr_array_index(a, i);
+        MprisPlayerInfo *pb = g_ptr_array_index(b, i);
+        if (g_strcmp0(pa->bus_name, pb->bus_name) != 0 ||
+            g_strcmp0(pa->identity, pb->identity) != 0 ||
+            g_strcmp0(pa->status, pb->status) != 0) {
+            return FALSE;
+        }
+    }
+    return TRUE;
 }
 
 gboolean mpris_client_poll(MprisClient *client) {
@@ -295,60 +345,108 @@ gboolean mpris_client_poll(MprisClient *client) {
         return FALSE;
     }
 
-    GPtrArray *players = list_players(client);
-    char *chosen = NULL;
-    char *fallback = NULL;
+    GPtrArray *names = list_players(client);
+    GPtrArray *discovered = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)player_info_free);
+    for (guint i = 0; i < names->len; i++) {
+        const char *name = g_ptr_array_index(names, i);
+        MprisPlayerInfo *info = g_new0(MprisPlayerInfo, 1);
+        info->bus_name = g_strdup(name);
+        info->identity = player_identity(client, name);
+        info->status = player_status(client, name);
+        g_ptr_array_add(discovered, info);
+    }
+    g_ptr_array_unref(names);
 
-    for (guint i = 0; i < players->len; i++) {
-        const char *name = g_ptr_array_index(players, i);
-        char *status = player_status(client, name);
-        if (g_strcmp0(status, "Playing") == 0) {
-            chosen = g_strdup(name);
-            g_free(status);
-            break;
+    const char *chosen = NULL;
+    if (client->preferred != NULL) {
+        for (guint i = 0; i < discovered->len; i++) {
+            MprisPlayerInfo *info = g_ptr_array_index(discovered, i);
+            if (g_strcmp0(info->bus_name, client->preferred) == 0) {
+                chosen = info->bus_name;
+                break;
+            }
         }
-        if (g_strcmp0(name, client->state.player) == 0) {
-            g_free(fallback);
-            fallback = g_strdup(name);
-        } else if (fallback == NULL) {
-            fallback = g_strdup(name);
-        }
-        g_free(status);
     }
     if (chosen == NULL) {
-        chosen = fallback;
-        fallback = NULL;
+        for (guint i = 0; i < discovered->len; i++) {
+            MprisPlayerInfo *info = g_ptr_array_index(discovered, i);
+            if (g_strcmp0(info->status, "Playing") == 0) {
+                chosen = info->bus_name;
+                break;
+            }
+        }
     }
-    g_free(fallback);
-    g_ptr_array_unref(players);
+    if (chosen == NULL && client->state.player != NULL) {
+        for (guint i = 0; i < discovered->len; i++) {
+            MprisPlayerInfo *info = g_ptr_array_index(discovered, i);
+            if (g_strcmp0(info->bus_name, client->state.player) == 0) {
+                chosen = info->bus_name;
+                break;
+            }
+        }
+    }
+    if (chosen == NULL && discovered->len > 0) {
+        chosen = ((MprisPlayerInfo *)g_ptr_array_index(discovered, 0))
+                     ->bus_name;
+    }
 
     MprisState next = { 0 };
+    gboolean state_changed = FALSE;
     if (chosen == NULL || !query_player(client, chosen, &next)) {
-        g_free(chosen);
-        gboolean changed = client->state.available;
+        state_changed = client->state.available;
         state_clear(&client->state);
-        if (changed && client->changed != NULL) {
-            client->changed(client, client->user_data);
-        }
-        return changed;
-    }
-    g_free(chosen);
-
-    gboolean changed = !state_equal(&client->state, &next);
-    if (changed) {
-        state_clear(&client->state);
-        client->state = next;
-        if (client->changed != NULL) {
-            client->changed(client, client->user_data);
-        }
     } else {
-        state_clear(&next);
+        state_changed = !state_equal(&client->state, &next);
+        if (state_changed) {
+            state_clear(&client->state);
+            client->state = next;
+        } else {
+            state_clear(&next);
+        }
+    }
+
+    gboolean players_changed = !players_equal(client->players, discovered);
+    if (players_changed) {
+        g_ptr_array_set_size(client->players, 0);
+        for (guint i = 0; i < discovered->len; i++) {
+            g_ptr_array_add(client->players,
+                            g_ptr_array_index(discovered, i));
+        }
+        g_ptr_array_set_free_func(discovered, NULL);
+    }
+    g_ptr_array_unref(discovered);
+
+    gboolean changed = state_changed || players_changed;
+    if (changed && client->changed != NULL) {
+        client->changed(client, client->user_data);
     }
     return changed;
 }
 
 const MprisState *mpris_client_state(MprisClient *client) {
     return client != NULL ? &client->state : NULL;
+}
+
+guint mpris_client_player_count(MprisClient *client) {
+    return client != NULL ? client->players->len : 0;
+}
+
+const MprisPlayerInfo *mpris_client_player(MprisClient *client,
+                                           guint index) {
+    if (client == NULL || index >= client->players->len) {
+        return NULL;
+    }
+    return g_ptr_array_index(client->players, index);
+}
+
+void mpris_client_select_player(MprisClient *client,
+                                const char *bus_name) {
+    if (client == NULL) {
+        return;
+    }
+    g_free(client->preferred);
+    client->preferred = g_strdup(bus_name);
 }
 
 static void call_player_method(MprisClient *client, const char *method) {
@@ -407,10 +505,17 @@ void mpris_client_seek(MprisClient *client, gint64 offset_us) {
 }
 
 void mpris_client_set_position(MprisClient *client, gint64 position_us) {
-    if (client->connection == NULL || client->state.player == NULL ||
-        client->state.track_id == NULL) {
+    if (client->connection == NULL || client->state.player == NULL) {
         return;
     }
+    if (client->state.track_id == NULL) {
+        if (client->state.can_seek) {
+            mpris_client_seek(client,
+                              position_us - client->state.position_us);
+        }
+        return;
+    }
+
     GError *error = NULL;
     GVariant *reply = g_dbus_connection_call_sync(
         client->connection, client->state.player, MPRIS_PATH, MPRIS_PLAYER,
@@ -419,6 +524,10 @@ void mpris_client_set_position(MprisClient *client, gint64 position_us) {
         G_DBUS_CALL_FLAGS_NONE, 1500, NULL, &error);
     if (reply != NULL) {
         g_variant_unref(reply);
+    }
+    if (reply == NULL && client->state.can_seek) {
+        mpris_client_seek(client,
+                          position_us - client->state.position_us);
     }
     g_clear_error(&error);
 }
