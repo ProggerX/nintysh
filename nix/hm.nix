@@ -16,6 +16,7 @@ let
       "#define NINTYSH_FONT_PX ${toString settings.font.size}"
       "#define NINTYSH_BAR_HEIGHT ${toString settings.bar.height}"
       "#define NINTYSH_BAR_SCALE ${toString settings.bar.scale}"
+      "#define NINTYSH_BAR_POSITION ${if settings.bar.position == "top" then "1" else "0"}"
       "#define NINTYSH_TASKBAR_APPS ${if settings.bar.showApps then "1" else "0"}"
       "#define NINTYSH_PANEL_SCALE ${toString settings.panels.scale}"
       "#define NINTYSH_WALLPAPER_DIR ${builtins.toJSON settings.wallpaper.directory}"
@@ -132,6 +133,11 @@ in
               type = lib.types.number;
               default = 1.0;
               description = "Taskbar scaling factor.";
+            };
+            position = lib.mkOption {
+              type = lib.types.enum [ "bottom" "top" ];
+              default = "bottom";
+              description = "Screen edge where the taskbar is placed.";
             };
             showApps = lib.mkOption {
               type = lib.types.bool;

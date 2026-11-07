@@ -41,6 +41,17 @@ static double panel_bar_height(void) {
     return bar_height_px() / panel_scale();
 }
 
+static gboolean bar_at_top(void) {
+    return NINTYSH_BAR_POSITION == NINTYSH_BAR_POSITION_TOP;
+}
+
+static double panel_y_for(double frame_h, double screen_h, double gap) {
+    if (bar_at_top()) {
+        return panel_bar_height() + gap;
+    }
+    return screen_h - panel_bar_height() - frame_h - gap;
+}
+
 typedef enum {
     HIT_NONE,
     HIT_START,
@@ -2625,7 +2636,8 @@ static MenuLayout menu_layout(NintyBar *bar, double screen_w,
     }
     layout.h = MIN(wanted, MIN(NINTYSH_MENU_MAX_HEIGHT, max_height));
     layout.x = 2.0;
-    layout.y = screen_h - bar_height_px() - layout.h - 1.0;
+    layout.y = bar_at_top() ? bar_height_px() + 1.0
+                            : screen_h - bar_height_px() - layout.h - 1.0;
     if (layout.y < 2.0) {
         layout.y = 2.0;
     }
@@ -3083,10 +3095,10 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
 
     if (kind == PANEL_TASKMENU) {
         frame.x = bar->context_x;
-        frame.y = screen_h - panel_bar_height() - frame.h - 4.0;
+        frame.y = panel_y_for(frame.h, screen_h, 4.0);
     } else {
         frame.x = screen_w - frame.w - 6.0;
-        frame.y = screen_h - panel_bar_height() - frame.h - 6.0;
+        frame.y = panel_y_for(frame.h, screen_h, 6.0);
     }
     if (frame.x + frame.w > screen_w - 2.0) {
         frame.x = screen_w - frame.w - 2.0;
@@ -4605,18 +4617,20 @@ static int control_center_layout(NintyBar *bar, double screen_w,
 
     int count = 0;
     double column_x = 16.0;
-    double row_y = 16.0;
+    double start_y = bar_at_top() ? panel_bar_height() + 16.0 : 16.0;
+    double row_y = start_y;
     double column_w = 0.0;
-    double bottom_limit = screen_h - panel_bar_height() - 2.0;
+    double bottom_limit =
+        bar_at_top() ? screen_h - 2.0 : screen_h - panel_bar_height() - 2.0;
 
     for (guint i = 0; i < G_N_ELEMENTS(order) && count < capacity; i++) {
         PanelKind kind = order[i];
         PanelFrame frame =
             panel_frame_for(bar, kind, screen_w, screen_h);
 
-        if (row_y > 16.0 && row_y + frame.h > bottom_limit) {
+        if (row_y > start_y && row_y + frame.h > bottom_limit) {
             column_x += column_w + 16.0;
-            row_y = 16.0;
+            row_y = start_y;
             column_w = 0.0;
         }
 
@@ -4744,7 +4758,12 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
                 panel_frame_for(bar, PANEL_VISUALIZER, logical_w, logical_h);
             viz.x = frame.x;
             viz.w = frame.w;
-            viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+            if (bar_at_top()) {
+                viz.y = MIN(logical_h - viz.h - 8.0,
+                            frame.y + frame.h + 6.0);
+            } else {
+                viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+            }
             panel_draw_kind(cr, bar, PANEL_VISUALIZER, &viz);
         }
         panel_draw_kind(cr, bar, bar->panel_kind, &frame);
@@ -5278,7 +5297,11 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
                                          height);
         viz.x = frame.x;
         viz.w = frame.w;
-        viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+        if (bar_at_top()) {
+            viz.y = MIN(height - viz.h - 8.0, frame.y + frame.h + 6.0);
+        } else {
+            viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+        }
         if (x >= viz.x && x < viz.x + viz.w && y >= viz.y &&
             y < viz.y + viz.h) {
             return;
@@ -7002,8 +7025,13 @@ static void create_bar_surface(NintyBar *bar, GdkMonitor *monitor) {
     if (monitor != NULL) {
         gtk_layer_set_monitor(GTK_WINDOW(window), monitor);
     }
-    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         TRUE);
+    if (bar_at_top()) {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,
+                             TRUE);
+    } else {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                             TRUE);
+    }
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT, TRUE);
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
                          TRUE);
@@ -7401,12 +7429,19 @@ static GtkWidget *create_notification_popup(NintyBar *bar, int width,
     gtk_layer_init_for_window(GTK_WINDOW(window));
     gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-notification");
     gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_OVERLAY);
-    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         TRUE);
+    if (bar_at_top()) {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,
+                             TRUE);
+        gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,
+                             NINTYSH_OSD_MARGIN_BOTTOM);
+    } else {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                             TRUE);
+        gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                             NINTYSH_OSD_MARGIN_BOTTOM);
+    }
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
                          TRUE);
-    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         NINTYSH_OSD_MARGIN_BOTTOM);
     gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
                          NINTYSH_NOTIFICATION_POPUP_MARGIN);
     gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
@@ -7499,12 +7534,19 @@ static GtkWidget *create_osd_window(NintyBar *bar) {
     gtk_layer_init_for_window(GTK_WINDOW(window));
     gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-osd");
     gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_OVERLAY);
-    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         TRUE);
+    if (bar_at_top()) {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,
+                             TRUE);
+        gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_TOP,
+                             NINTYSH_OSD_MARGIN_BOTTOM);
+    } else {
+        gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                             TRUE);
+        gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                             NINTYSH_OSD_MARGIN_BOTTOM);
+    }
     gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
                          TRUE);
-    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
-                         NINTYSH_OSD_MARGIN_BOTTOM);
     gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_LEFT,
                          MAX(2, (geometry.width - NINTYSH_OSD_WIDTH) / 2));
     gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
