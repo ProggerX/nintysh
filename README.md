@@ -10,17 +10,7 @@ No support. No guarantees. It works on my machine.
 
 ### Screenshots
 
-| Desktop | Launcher |
-| --- | --- |
-| ![Desktop](docs/screenshots/01-desktop.png) | ![Launcher](docs/screenshots/02-launcher.png) |
-
-| Volume | Clipboard |
-| --- | --- |
-| ![Volume](docs/screenshots/03-volume.png) | ![Clipboard](docs/screenshots/04-clipboard.png) |
-
-| Calendar | OSD |
-| --- | --- |
-| ![Calendar](docs/screenshots/05-calendar.png) | ![OSD](docs/screenshots/06-osd.png) |
+![nintysh](scrot.png)
 
 ### Requirements
 
