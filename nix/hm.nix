@@ -32,6 +32,19 @@ let
       "#define NINTYSH_CLIPBOARD_MAX_BYTES ${toString settings.clipboard.maxBytes}"
       "#define NINTYSH_CLIPBOARD_POLL_SECONDS ${toString settings.clipboard.pollSeconds}"
       "#define NINTYSH_CLIPBOARD_ROW_HEIGHT ${toString settings.clipboard.rowHeight}"
+      "#define NINTYSH_AUDIO_STEP ${toString settings.audio.step}"
+      "#define NINTYSH_AUDIO_MAX_ROWS ${toString settings.audio.maxRows}"
+      "#define NINTYSH_NOTIFICATION_MAX_ENTRIES ${toString settings.notifications.maxEntries}"
+      "#define NINTYSH_NOTIFICATION_TIMEOUT_MS ${toString settings.notifications.timeoutMs}"
+      "#define NINTYSH_NOTIFICATION_ROW_HEIGHT ${toString settings.notifications.rowHeight}"
+      "#define NINTYSH_NOTIFICATION_POPUP_WIDTH ${toString settings.notifications.popupWidth}"
+      "#define NINTYSH_NOTIFICATION_POPUP_MAX ${toString settings.notifications.popupMax}"
+      "#define NINTYSH_NOTIFICATION_POPUP_MARGIN ${toString settings.notifications.popupMargin}"
+      "#define NINTYSH_LOCK_COMMAND ${builtins.toJSON settings.commands.lock}"
+      "#define NINTYSH_BRIGHTNESS_UP_COMMAND ${builtins.toJSON settings.commands.brightnessUp}"
+      "#define NINTYSH_BRIGHTNESS_DOWN_COMMAND ${builtins.toJSON settings.commands.brightnessDown}"
+      "#define NINTYSH_SCREENSHOT_REGION_COMMAND ${builtins.toJSON settings.commands.screenshotRegion}"
+      "#define NINTYSH_SCREENSHOT_FULLSCREEN_COMMAND ${builtins.toJSON settings.commands.screenshotFullscreen}"
       "#define NINTYSH_CLOCK_TICK_SECONDS ${toString settings.updates.clockSeconds}"
       "#define NINTYSH_SYSTEM_POLL_SECONDS ${toString settings.updates.systemSeconds}"
       "#define NINTYSH_COLOR_FACE ${color settings.colors.face}"
@@ -206,6 +219,80 @@ in
               type = lib.types.number;
               default = 20.0;
               description = "Clipboard row height.";
+            };
+          };
+
+          audio = {
+            step = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 5;
+              description = "Volume/microphone step in percent.";
+            };
+            maxRows = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 6;
+              description = "Maximum output/input device rows shown in the audio panel.";
+            };
+          };
+
+          notifications = {
+            maxEntries = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 50;
+              description = "Maximum notification history entries.";
+            };
+            timeoutMs = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 6000;
+              description = "Notification toast timeout in milliseconds.";
+            };
+            rowHeight = lib.mkOption {
+              type = lib.types.number;
+              default = 34.0;
+              description = "Notification list row height.";
+            };
+            popupWidth = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 380;
+              description = "Notification popup width.";
+            };
+            popupMax = lib.mkOption {
+              type = lib.types.ints.positive;
+              default = 3;
+              description = "Maximum notification cards in the popup.";
+            };
+            popupMargin = lib.mkOption {
+              type = lib.types.ints.unsigned;
+              default = 12;
+              description = "Notification popup right margin.";
+            };
+          };
+
+          commands = {
+            lock = lib.mkOption {
+              type = lib.types.str;
+              default = "loginctl lock-session";
+              description = "Command run by `nintysh msg session-lock`.";
+            };
+            brightnessUp = lib.mkOption {
+              type = lib.types.str;
+              default = "brightnessctl set +5%";
+              description = "Command run by `nintysh msg brightness-up`.";
+            };
+            brightnessDown = lib.mkOption {
+              type = lib.types.str;
+              default = "brightnessctl set 5%-";
+              description = "Command run by `nintysh msg brightness-down`.";
+            };
+            screenshotRegion = lib.mkOption {
+              type = lib.types.str;
+              default = "grim -g \"$(slurp)\" - | wl-copy";
+              description = "Command run by `nintysh msg screenshot-region`.";
+            };
+            screenshotFullscreen = lib.mkOption {
+              type = lib.types.str;
+              default = "grim - | wl-copy";
+              description = "Command run by `nintysh msg screenshot-fullscreen`.";
             };
           };
 

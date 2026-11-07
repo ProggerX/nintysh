@@ -8,6 +8,9 @@
   gtk4-layer-shell,
   json-glib,
   wl-clipboard,
+  brightnessctl,
+  grim,
+  slurp,
   extraConfig ? "",
   wrapperArgs ? [ ],
 }:
@@ -42,7 +45,8 @@ stdenv.mkDerivation {
   '';
 
   gappsWrapperArgs = [
-    "--prefix" "PATH" ":" (lib.makeBinPath [ wl-clipboard ])
+    "--prefix" "PATH" ":"
+    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp ])
   ] ++ wrapperArgs;
 
   buildPhase = ''

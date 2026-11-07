@@ -35,6 +35,9 @@
               gdb
               niri
               wl-clipboard
+              brightnessctl
+              grim
+              slurp
             ];
           };
 
