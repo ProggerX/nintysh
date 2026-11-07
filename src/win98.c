@@ -329,3 +329,56 @@ void win98_draw_clipboard_icon(cairo_t *cr, double x, double y) {
 
     cairo_restore(cr);
 }
+
+void win98_draw_media_icon(cairo_t *cr, double x, double y,
+                           gboolean playing) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    win98_fill(cr, 1, 1, 14, 14, win98_face);
+    win98_bevel(cr, 1, 1, 14, 14, WIN98_BEVEL_RAISED);
+
+    cairo_set_source_rgb(cr, win98_black.r, win98_black.g, win98_black.b);
+    cairo_set_line_width(cr, 1.0);
+    cairo_arc(cr, 5.0, 12.0, 2.4, 0, 2 * M_PI);
+    cairo_arc(cr, 11.0, 10.0, 2.4, 0, 2 * M_PI);
+    cairo_fill(cr);
+
+    win98_fill(cr, 7, 4, 1, 8, win98_black);
+    win98_fill(cr, 13, 2, 1, 8, win98_black);
+    win98_fill(cr, 7, 3, 7, 2, win98_black);
+
+    if (playing) {
+        win98_fill(cr, 11, 10, 4, 4, win98_green);
+    }
+
+    cairo_restore(cr);
+}
+
+void win98_draw_notification_icon(cairo_t *cr, double x, double y,
+                                  gboolean active) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    win98_fill(cr, 1, 2, 14, 10, win98_face);
+    win98_bevel(cr, 1, 2, 14, 10, WIN98_BEVEL_RAISED);
+
+    const double bubble[] = { 3, 4, 13, 4, 13, 10, 7, 10, 4, 13, 4, 10, 3,
+                              10 };
+    polygon(cr, bubble, 14);
+    cairo_set_source_rgb(cr, win98_white.r, win98_white.g, win98_white.b);
+    cairo_fill_preserve(cr);
+    cairo_set_source_rgb(cr, win98_black.r, win98_black.g, win98_black.b);
+    cairo_set_line_width(cr, 1.0);
+    cairo_stroke(cr);
+
+    win98_fill(cr, 5, 6, 6, 1, win98_shadow);
+    win98_fill(cr, 5, 8, 4, 1, win98_shadow);
+
+    if (active) {
+        win98_fill(cr, 11, 1, 4, 4, win98_red);
+        win98_bevel(cr, 11, 1, 4, 4, WIN98_BEVEL_RAISED);
+    }
+
+    cairo_restore(cr);
+}

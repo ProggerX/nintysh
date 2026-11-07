@@ -2,9 +2,11 @@
 
 #include "config.h"
 #include "control.h"
+#include "mpris.h"
 #include "niri.h"
 #include "win98.h"
 
+#include <gio/gio.h>
 #include <gsk/gsk.h>
 #include <gtk4-layer-shell.h>
 #include <math.h>
@@ -28,6 +30,8 @@ typedef enum {
     HIT_NETWORK,
     HIT_BATTERY,
     HIT_CLIPBOARD,
+    HIT_NOTIFICATIONS,
+    HIT_MEDIA,
 } HitKind;
 
 typedef struct {
@@ -61,7 +65,39 @@ typedef enum {
     PANEL_POWER,
     PANEL_TASKMENU,
     PANEL_CLIPBOARD,
+    PANEL_NOTIFICATIONS,
+    PANEL_MEDIA,
 } PanelKind;
+
+typedef struct {
+    int id;
+    char *label;
+    gboolean is_default;
+} AudioDevice;
+
+typedef struct {
+    guint id;
+    NintyBar *bar;
+    char *app_name;
+    char *summary;
+    char *body;
+    char *app_icon;
+    char *image_path;
+    char **actions;
+    GdkTexture *image;
+    gboolean active;
+    guint expire_source;
+    gint64 timestamp;
+} NintyNotification;
+
+typedef struct {
+    guint id;
+    char *action;
+    double x;
+    double y;
+    double w;
+    double h;
+} NotificationPopupHit;
 
 typedef struct {
     double x;
@@ -90,8 +126,14 @@ struct NintyBar {
     GtkWidget *panel_area;
     GtkWidget *osd_window;
     GtkWidget *osd_area;
+    GtkWidget *popup_window;
+    GtkWidget *popup_area;
+    GPtrArray *popup_hits;
 
     NiriClient *niri;
+    MprisClient *mpris;
+    char *media_art_source;
+    GdkTexture *media_art;
     GPtrArray *apps;
     GPtrArray *menu_results;
     GPtrArray *surfaces;
@@ -102,15 +144,27 @@ struct NintyBar {
     GtkIconTheme *icon_theme;
     GPtrArray *clipboard_history;
     char *last_clipboard;
+    GPtrArray *audio_sinks;
+    GPtrArray *audio_sources;
+    GPtrArray *notifications;
 
     guint tick_source;
     guint slow_source;
     guint clipboard_source;
     gulong network_handler;
+    guint notifications_bus;
+    guint notifications_registration;
+    GDBusConnection *notifications_connection;
+    GDBusNodeInfo *notifications_node;
+    guint next_notification_id;
+    guint popup_update_source;
 
     gboolean volume_available;
     gboolean volume_muted;
     int volume_percent;
+    gboolean source_available;
+    gboolean source_muted;
+    int source_percent;
     gboolean network_available;
     gboolean battery_available;
     gboolean battery_charging;
@@ -126,9 +180,11 @@ struct NintyBar {
     int calendar_year;
     int calendar_month;
     gboolean volume_dragging;
+    gboolean volume_drag_source;
     double volume_drag_x0;
     int panel_hover;
     int clipboard_scroll;
+    int notification_scroll;
     gint64 context_window_id;
     double context_x;
 
@@ -144,6 +200,12 @@ static void close_panel(NintyBar *bar);
 static void open_panel(NintyBar *bar, PanelKind kind);
 static void osd_show_volume(NintyBar *bar);
 static void osd_show_text(NintyBar *bar, const char *text);
+static void osd_show_text_timeout(NintyBar *bar, const char *text,
+                                  guint timeout);
+static void notification_popup_update(NintyBar *bar);
+static void notification_popup_destroy(NintyBar *bar);
+static void notification_emit_closed(NintyBar *bar, guint id,
+                                     guint reason);
 
 static void bar_clear_hits(NintyBar *bar) {
     if (bar->active_hits == NULL) {
@@ -409,11 +471,10 @@ static GtkIconPaintable *window_icon(NintyBar *bar, NiriWindow *window) {
     return paintable;
 }
 
-static void draw_paintable(cairo_t *cr, GtkIconPaintable *paintable,
-                           double x, double y, double size) {
+static void draw_gdk_paintable(cairo_t *cr, GdkPaintable *paintable,
+                               double x, double y, double size) {
     GtkSnapshot *snapshot = gtk_snapshot_new();
-    gdk_paintable_snapshot(GDK_PAINTABLE(paintable), snapshot, (int)size,
-                           (int)size);
+    gdk_paintable_snapshot(paintable, snapshot, (int)size, (int)size);
     GskRenderNode *node = gtk_snapshot_free_to_node(snapshot);
     if (node == NULL) {
         return;
@@ -424,6 +485,11 @@ static void draw_paintable(cairo_t *cr, GtkIconPaintable *paintable,
     gsk_render_node_draw(node, cr);
     cairo_restore(cr);
     gsk_render_node_unref(node);
+}
+
+static void draw_paintable(cairo_t *cr, GtkIconPaintable *paintable,
+                           double x, double y, double size) {
+    draw_gdk_paintable(cr, GDK_PAINTABLE(paintable), x, y, size);
 }
 
 static char *window_label(NiriWindow *window) {
@@ -479,6 +545,240 @@ static gboolean update_volume(NintyBar *bar) {
            old_percent != bar->volume_percent;
 }
 
+static gboolean update_source(NintyBar *bar) {
+    gboolean old_available = bar->source_available;
+    gboolean old_muted = bar->source_muted;
+    int old_percent = bar->source_percent;
+    char *output = NULL;
+
+    bar->source_available = FALSE;
+    if (run_command_sync("wpctl get-volume @DEFAULT_AUDIO_SOURCE@",
+                         &output)) {
+        const char *volume = strstr(output, "Volume:");
+        if (volume != NULL) {
+            volume += strlen("Volume:");
+            while (*volume == ' ') {
+                volume++;
+            }
+            double value = g_ascii_strtod(volume, NULL);
+            bar->source_available = TRUE;
+            bar->source_percent = (int)round(value * 100.0);
+            bar->source_muted = strstr(output, "MUTED") != NULL;
+        }
+    }
+    g_free(output);
+
+    return old_available != bar->source_available ||
+           old_muted != bar->source_muted ||
+           old_percent != bar->source_percent;
+}
+
+static void audio_device_free(AudioDevice *device) {
+    if (device == NULL) {
+        return;
+    }
+    g_free(device->label);
+    g_free(device);
+}
+
+static void audio_devices_clear(GPtrArray *devices) {
+    while (devices->len > 0) {
+        g_ptr_array_remove_index(devices, devices->len - 1);
+    }
+}
+
+static void audio_parse_section(const char *text, const char *section,
+                                GPtrArray *devices) {
+    gchar **lines = g_strsplit(text, "\n", -1);
+    gboolean in_audio = FALSE;
+    gboolean in_section = FALSE;
+
+    for (int i = 0; lines[i] != NULL; i++) {
+        const char *line = lines[i];
+
+        if (g_str_has_prefix(line, "Audio")) {
+            in_audio = TRUE;
+            in_section = FALSE;
+            continue;
+        }
+        if (!in_audio) {
+            continue;
+        }
+        if (line[0] != '\0' && !g_ascii_isspace(line[0]) &&
+            line[0] != '[') {
+            in_audio = FALSE;
+            in_section = FALSE;
+            continue;
+        }
+
+        gboolean is_target = strstr(line, section) != NULL;
+        gboolean is_other_section =
+            strstr(line, "Sinks:") != NULL ||
+            strstr(line, "Sources:") != NULL ||
+            strstr(line, "Filters:") != NULL ||
+            strstr(line, "Streams:") != NULL ||
+            strstr(line, "Devices:") != NULL;
+
+        if (is_target) {
+            in_section = TRUE;
+            continue;
+        }
+        if (is_other_section) {
+            in_section = FALSE;
+            continue;
+        }
+        if (!in_section) {
+            continue;
+        }
+
+        const char *scan = line;
+        gboolean is_default = FALSE;
+        gboolean valid = TRUE;
+        while (*scan != '\0') {
+            gunichar character = g_utf8_get_char(scan);
+            if (character == '*') {
+                is_default = TRUE;
+                scan = g_utf8_next_char(scan);
+            } else if (character >= '0' && character <= '9') {
+                break;
+            } else if (g_ascii_isspace(character) ||
+                       character == 0x2502 || character == 0x251C ||
+                       character == 0x2514 || character == 0x2500 ||
+                       character == 0x251D || character == 0x2503) {
+                scan = g_utf8_next_char(scan);
+            } else {
+                valid = FALSE;
+                break;
+            }
+        }
+        if (!valid || *scan == '\0') {
+            continue;
+        }
+
+        char *end = NULL;
+        long id = strtol(scan, &end, 10);
+        if (end == NULL || *end != '.' || id <= 0) {
+            continue;
+        }
+        const char *label = end + 1;
+        while (g_ascii_isspace(*label)) {
+            label++;
+        }
+
+        char *copy = g_strdup(label);
+        char *bracket = strrchr(copy, '[');
+        if (bracket != NULL) {
+            *bracket = '\0';
+        }
+        g_strstrip(copy);
+        if (copy[0] == '\0') {
+            g_free(copy);
+            continue;
+        }
+
+        AudioDevice *device = g_new0(AudioDevice, 1);
+        device->id = (int)id;
+        device->label = copy;
+        device->is_default = is_default;
+        g_ptr_array_add(devices, device);
+    }
+    g_strfreev(lines);
+}
+
+static gboolean audio_devices_equal(GPtrArray *a, GPtrArray *b) {
+    if (a->len != b->len) {
+        return FALSE;
+    }
+    for (guint i = 0; i < a->len; i++) {
+        AudioDevice *da = g_ptr_array_index(a, i);
+        AudioDevice *db = g_ptr_array_index(b, i);
+        if (da->id != db->id || da->is_default != db->is_default ||
+            g_strcmp0(da->label, db->label) != 0) {
+            return FALSE;
+        }
+    }
+    return TRUE;
+}
+
+static gboolean update_audio_devices(NintyBar *bar) {
+    char *output = NULL;
+    if (!run_command_sync("wpctl status", &output)) {
+        g_free(output);
+        return FALSE;
+    }
+
+    GPtrArray *sinks = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)audio_device_free);
+    GPtrArray *sources = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)audio_device_free);
+
+    audio_parse_section(output, "Sinks:", sinks);
+    audio_parse_section(output, "Sources:", sources);
+    g_free(output);
+
+    gboolean changed = !audio_devices_equal(bar->audio_sinks, sinks) ||
+                       !audio_devices_equal(bar->audio_sources, sources);
+
+    audio_devices_clear(bar->audio_sinks);
+    audio_devices_clear(bar->audio_sources);
+    for (guint i = 0; i < sinks->len; i++) {
+        g_ptr_array_add(bar->audio_sinks, g_ptr_array_index(sinks, i));
+    }
+    for (guint i = 0; i < sources->len; i++) {
+        g_ptr_array_add(bar->audio_sources, g_ptr_array_index(sources, i));
+    }
+    g_ptr_array_set_free_func(sinks, NULL);
+    g_ptr_array_set_free_func(sources, NULL);
+    g_ptr_array_unref(sinks);
+    g_ptr_array_unref(sources);
+
+    return changed;
+}
+
+static const char *audio_default_label(GPtrArray *devices) {
+    for (guint i = 0; i < devices->len; i++) {
+        AudioDevice *device = g_ptr_array_index(devices, i);
+        if (device->is_default) {
+            return device->label;
+        }
+    }
+    return NULL;
+}
+
+static void update_media_art(NintyBar *bar) {
+    const MprisState *state = mpris_client_state(bar->mpris);
+    const char *url = state != NULL && state->available ? state->art_url
+                                                        : NULL;
+
+    if (g_strcmp0(url, bar->media_art_source) == 0) {
+        return;
+    }
+    g_free(bar->media_art_source);
+    bar->media_art_source = g_strdup(url);
+    if (bar->media_art != NULL) {
+        g_object_unref(bar->media_art);
+        bar->media_art = NULL;
+    }
+    if (url == NULL || url[0] == '\0') {
+        return;
+    }
+
+    char *path = NULL;
+    if (g_str_has_prefix(url, "file://")) {
+        path = g_filename_from_uri(url, NULL, NULL);
+    } else if (g_path_is_absolute(url)) {
+        path = g_strdup(url);
+    }
+    if (path != NULL && g_file_test(path, G_FILE_TEST_IS_REGULAR)) {
+        GError *error = NULL;
+        GFile *file = g_file_new_for_path(path);
+        bar->media_art = gdk_texture_new_from_file(file, &error);
+        g_clear_error(&error);
+        g_object_unref(file);
+    }
+    g_free(path);
+}
+
 static gboolean toggle_volume(NintyBar *bar) {
     char *output = NULL;
     gboolean ok = run_command_sync(
@@ -490,6 +790,27 @@ static gboolean toggle_volume(NintyBar *bar) {
         gtk_widget_queue_draw(bar->panel_area);
     }
     osd_show_volume(bar);
+    return ok;
+}
+
+static gboolean toggle_source(NintyBar *bar) {
+    char *output = NULL;
+    gboolean ok = run_command_sync(
+        "wpctl set-mute @DEFAULT_AUDIO_SOURCE@ toggle", &output);
+    g_free(output);
+    update_source(bar);
+    bar_queue_redraw(bar);
+    if (bar->panel_area != NULL) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    if (bar->source_muted) {
+        osd_show_text(bar, "Microphone muted");
+    } else {
+        char text[64];
+        g_snprintf(text, sizeof(text), "Microphone %d%%",
+                   bar->source_percent);
+        osd_show_text(bar, text);
+    }
     return ok;
 }
 
@@ -513,6 +834,66 @@ static void apply_volume(NintyBar *bar, int percent, gboolean commit) {
         gtk_widget_queue_draw(bar->panel_area);
     }
     osd_show_volume(bar);
+}
+
+static void apply_source_volume(NintyBar *bar, int percent,
+                                gboolean commit) {
+    percent = CLAMP(percent, 0, 100);
+    bar->source_available = TRUE;
+    bar->source_percent = percent;
+
+    if (commit) {
+        char command[128];
+        char *output = NULL;
+        g_snprintf(command, sizeof(command),
+                   "wpctl set-volume @DEFAULT_AUDIO_SOURCE@ %.2f",
+                   percent / 100.0);
+        run_command_sync(command, &output);
+        g_free(output);
+        update_source(bar);
+        bar_queue_redraw(bar);
+    }
+    if (bar->panel_area != NULL) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    if (bar->source_muted) {
+        osd_show_text(bar, "Microphone muted");
+    } else {
+        char text[64];
+        g_snprintf(text, sizeof(text), "Microphone %d%%",
+                   bar->source_percent);
+        osd_show_text(bar, text);
+    }
+}
+
+static void set_default_audio_device(NintyBar *bar, int id,
+                                     gboolean source) {
+    char command[128];
+    char *output = NULL;
+    g_snprintf(command, sizeof(command), "wpctl set-default %d", id);
+    run_command_sync(command, &output);
+    g_free(output);
+
+    update_audio_devices(bar);
+    if (source) {
+        update_source(bar);
+        const char *label = audio_default_label(bar->audio_sources);
+        char text[160];
+        g_snprintf(text, sizeof(text), "Microphone: %s",
+                   label != NULL ? label : "unknown");
+        osd_show_text(bar, text);
+    } else {
+        update_volume(bar);
+        const char *label = audio_default_label(bar->audio_sinks);
+        char text[160];
+        g_snprintf(text, sizeof(text), "Output: %s",
+                   label != NULL ? label : "unknown");
+        osd_show_text(bar, text);
+    }
+    bar_queue_redraw(bar);
+    if (bar->panel_area != NULL) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
 }
 
 static gboolean read_text_file(const char *path, char **contents) {
@@ -669,6 +1050,443 @@ static gboolean clipboard_tick(gpointer user_data) {
     }
     g_free(output);
     return G_SOURCE_CONTINUE;
+}
+
+static void notification_free(NintyNotification *notification) {
+    if (notification == NULL) {
+        return;
+    }
+    if (notification->expire_source != 0) {
+        g_source_remove(notification->expire_source);
+    }
+    g_free(notification->app_name);
+    g_free(notification->summary);
+    g_free(notification->body);
+    g_free(notification->app_icon);
+    g_free(notification->image_path);
+    g_strfreev(notification->actions);
+    if (notification->image != NULL) {
+        g_object_unref(notification->image);
+    }
+    g_free(notification);
+}
+
+static void notification_trim(NintyBar *bar) {
+    while (bar->notifications->len > NINTYSH_NOTIFICATION_MAX_ENTRIES) {
+        g_ptr_array_remove_index(bar->notifications,
+                                 bar->notifications->len - 1);
+    }
+}
+
+static int notification_index_for_id(NintyBar *bar, guint id) {
+    for (guint i = 0; i < bar->notifications->len; i++) {
+        NintyNotification *notification =
+            g_ptr_array_index(bar->notifications, i);
+        if (notification->id == id) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static gboolean notification_has_buttons(NintyNotification *notification) {
+    if (notification->actions == NULL) {
+        return FALSE;
+    }
+    for (int i = 0; notification->actions[i] != NULL; i += 2) {
+        const char *label = notification->actions[i + 1];
+        if (label != NULL && label[0] != '\0') {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static const char *notification_default_action(
+    NintyNotification *notification) {
+    if (notification->actions == NULL) {
+        return NULL;
+    }
+    for (int i = 0; notification->actions[i] != NULL; i += 2) {
+        if (g_strcmp0(notification->actions[i], "default") == 0) {
+            return notification->actions[i];
+        }
+    }
+    return NULL;
+}
+
+static gboolean notification_expire_cb(gpointer user_data) {
+    NintyNotification *notification = user_data;
+    notification->expire_source = 0;
+    if (!notification->active) {
+        return G_SOURCE_REMOVE;
+    }
+    notification->active = FALSE;
+    notification_emit_closed(notification->bar, notification->id, 1);
+    notification_popup_update(notification->bar);
+    return G_SOURCE_REMOVE;
+}
+
+static void notification_schedule_expiry(NintyBar *bar,
+                                         NintyNotification *notification,
+                                         gint32 expire_timeout) {
+    (void)bar;
+    if (notification->expire_source != 0) {
+        g_source_remove(notification->expire_source);
+        notification->expire_source = 0;
+    }
+    guint timeout = expire_timeout > 0
+                        ? (guint)expire_timeout
+                        : NINTYSH_NOTIFICATION_TIMEOUT_MS;
+    notification->expire_source =
+        g_timeout_add(timeout, notification_expire_cb, notification);
+}
+
+static void notification_emit_action(NintyBar *bar, guint id,
+                                     const char *action) {
+    if (bar->notifications_connection == NULL) {
+        return;
+    }
+    g_dbus_connection_emit_signal(
+        bar->notifications_connection, NULL,
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "ActionInvoked",
+        g_variant_new("(us)", id, action), NULL);
+}
+
+static void notification_emit_closed(NintyBar *bar, guint id,
+                                     guint reason) {
+    if (bar->notifications_connection == NULL) {
+        return;
+    }
+    g_dbus_connection_emit_signal(
+        bar->notifications_connection, NULL,
+        "/org/freedesktop/Notifications",
+        "org.freedesktop.Notifications", "NotificationClosed",
+        g_variant_new("(uu)", id, reason), NULL);
+}
+
+static guint notification_add(NintyBar *bar, const char *app_name,
+                              const char *app_icon, const char *summary,
+                              const char *body, gchar **actions,
+                              const char *image_path, GdkTexture *image,
+                              gint32 expire_timeout,
+                              guint replaces_id) {
+    int index = replaces_id != 0
+                    ? notification_index_for_id(bar, replaces_id)
+                    : -1;
+    NintyNotification *notification = NULL;
+
+    if (index >= 0) {
+        notification = g_ptr_array_index(bar->notifications, (guint)index);
+    } else {
+        notification = g_new0(NintyNotification, 1);
+        notification->bar = bar;
+        bar->next_notification_id++;
+        if (bar->next_notification_id == 0) {
+            bar->next_notification_id = 1;
+        }
+        notification->id = bar->next_notification_id;
+        g_ptr_array_insert(bar->notifications, 0, notification);
+    }
+
+    g_free(notification->app_name);
+    g_free(notification->summary);
+    g_free(notification->body);
+    g_free(notification->app_icon);
+    g_free(notification->image_path);
+    g_strfreev(notification->actions);
+    if (notification->image != NULL) {
+        g_object_unref(notification->image);
+    }
+    notification->app_name = g_strdup(app_name);
+    notification->summary = g_strdup(summary);
+    notification->body = g_strdup(body);
+    notification->app_icon = g_strdup(app_icon);
+    notification->image_path = g_strdup(image_path);
+    notification->actions = actions != NULL ? g_strdupv(actions) : NULL;
+    notification->image = image;
+    notification->timestamp = g_get_real_time();
+    notification->active = TRUE;
+    notification_trim(bar);
+    notification_schedule_expiry(bar, notification, expire_timeout);
+
+    notification_popup_update(bar);
+    bar_queue_redraw(bar);
+    if (bar->panel_kind == PANEL_NOTIFICATIONS) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    return notification->id;
+}
+
+static void notification_remove_at(NintyBar *bar, guint index,
+                                   guint reason) {
+    if (index >= bar->notifications->len) {
+        return;
+    }
+    NintyNotification *notification =
+        g_ptr_array_index(bar->notifications, index);
+    guint id = notification->id;
+    g_ptr_array_remove_index(bar->notifications, index);
+    notification_emit_closed(bar, id, reason);
+    notification_popup_update(bar);
+    bar_queue_redraw(bar);
+    if (bar->panel_kind == PANEL_NOTIFICATIONS) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+}
+
+static void notifications_clear(NintyBar *bar) {
+    while (bar->notifications->len > 0) {
+        notification_remove_at(bar, bar->notifications->len - 1, 3);
+    }
+}
+
+static char *notification_image_path_from_hints(GVariant *hints) {
+    if (hints == NULL) {
+        return NULL;
+    }
+    const char *keys[] = { "image-path", "image_path", NULL };
+    for (int i = 0; keys[i] != NULL; i++) {
+        GVariant *value = g_variant_lookup_value(
+            hints, keys[i], G_VARIANT_TYPE_STRING);
+        if (value != NULL) {
+            char *path = g_variant_dup_string(value, NULL);
+            g_variant_unref(value);
+            return path;
+        }
+    }
+    return NULL;
+}
+
+static GdkTexture *notification_texture_from_hints(GVariant *hints) {
+    if (hints == NULL) {
+        return NULL;
+    }
+    GVariant *value = g_variant_lookup_value(
+        hints, "image-data", G_VARIANT_TYPE("(iiibiiay)"));
+    if (value == NULL) {
+        value = g_variant_lookup_value(
+            hints, "image_data", G_VARIANT_TYPE("(iiibiiay)"));
+    }
+    if (value == NULL) {
+        return NULL;
+    }
+
+    gint32 width = 0;
+    gint32 height = 0;
+    gint32 rowstride = 0;
+    gint32 bits = 0;
+    gint32 channels = 0;
+    gboolean has_alpha = FALSE;
+    GVariant *data = NULL;
+    GdkTexture *texture = NULL;
+
+    g_variant_get(value, "(iiibii@ay)", &width, &height, &rowstride,
+                  &has_alpha, &bits, &channels, &data);
+    (void)has_alpha;
+
+    gsize size = g_variant_get_size(data);
+    if (width > 0 && height > 0 && bits == 8 &&
+        (channels == 3 || channels == 4) &&
+        rowstride >= width * channels &&
+        size >= (gsize)rowstride * height) {
+        gsize needed = (gsize)rowstride * height;
+        gpointer copy = g_memdup2(g_variant_get_data(data), needed);
+        GBytes *bytes = g_bytes_new_take(copy, needed);
+        GdkMemoryFormat format =
+            channels == 4 ? GDK_MEMORY_R8G8B8A8 : GDK_MEMORY_R8G8B8;
+        texture = gdk_memory_texture_new(width, height, format, bytes,
+                                         rowstride);
+        g_bytes_unref(bytes);
+    }
+
+    g_variant_unref(data);
+    g_variant_unref(value);
+    return texture;
+}
+
+static void notification_method_call(GDBusConnection *connection,
+                                     const gchar *sender,
+                                     const gchar *object_path,
+                                     const gchar *interface_name,
+                                     const gchar *method_name,
+                                     GVariant *parameters,
+                                     GDBusMethodInvocation *invocation,
+                                     gpointer user_data) {
+    (void)connection;
+    (void)sender;
+    (void)object_path;
+    (void)interface_name;
+    NintyBar *bar = user_data;
+
+    if (g_strcmp0(method_name, "GetCapabilities") == 0) {
+        const char *capabilities[] = { "body", "actions",
+                                       "icon-static", NULL };
+        g_dbus_method_invocation_return_value(
+            invocation, g_variant_new("(^as)", capabilities));
+        return;
+    }
+
+    if (g_strcmp0(method_name, "GetServerInformation") == 0) {
+        g_dbus_method_invocation_return_value(
+            invocation,
+            g_variant_new("(ssss)", "nintysh", "nintysh", "0.1.0", "1.2"));
+        return;
+    }
+
+    if (g_strcmp0(method_name, "Notify") == 0) {
+        const gchar *app_name = NULL;
+        const gchar *app_icon = NULL;
+        const gchar *summary = NULL;
+        const gchar *body = NULL;
+        gchar **actions = NULL;
+        GVariant *hints = NULL;
+        guint32 replaces_id = 0;
+        gint32 expire_timeout = 0;
+
+        g_variant_get(parameters, "(&su&s&s&s^as@a{sv}i)", &app_name,
+                      &replaces_id, &app_icon, &summary, &body, &actions,
+                      &hints, &expire_timeout);
+        char *image_path = notification_image_path_from_hints(hints);
+        GdkTexture *image = notification_texture_from_hints(hints);
+        guint id = notification_add(bar, app_name, app_icon, summary, body,
+                                    actions, image_path, image,
+                                    expire_timeout, replaces_id);
+        g_free(image_path);
+        g_strfreev(actions);
+        g_variant_unref(hints);
+        g_dbus_method_invocation_return_value(invocation,
+                                              g_variant_new("(u)", id));
+        return;
+    }
+
+    if (g_strcmp0(method_name, "CloseNotification") == 0) {
+        guint32 id = 0;
+        g_variant_get(parameters, "(u)", &id);
+        int index = notification_index_for_id(bar, id);
+        if (index >= 0) {
+            notification_remove_at(bar, (guint)index, 3);
+        }
+        g_dbus_method_invocation_return_value(invocation, NULL);
+        return;
+    }
+
+    g_dbus_method_invocation_return_error(invocation, G_DBUS_ERROR,
+                                          G_DBUS_ERROR_UNKNOWN_METHOD,
+                                          "Unknown method %s",
+                                          method_name);
+}
+
+static const char notification_xml[] =
+    "<node>"
+    "  <interface name='org.freedesktop.Notifications'>"
+    "    <method name='GetCapabilities'>"
+    "      <arg type='as' direction='out'/>"
+    "    </method>"
+    "    <method name='GetServerInformation'>"
+    "      <arg type='s' direction='out'/>"
+    "      <arg type='s' direction='out'/>"
+    "      <arg type='s' direction='out'/>"
+    "      <arg type='s' direction='out'/>"
+    "    </method>"
+    "    <method name='Notify'>"
+    "      <arg type='s' direction='in'/>"
+    "      <arg type='u' direction='in'/>"
+    "      <arg type='s' direction='in'/>"
+    "      <arg type='s' direction='in'/>"
+    "      <arg type='s' direction='in'/>"
+    "      <arg type='as' direction='in'/>"
+    "      <arg type='a{sv}' direction='in'/>"
+    "      <arg type='i' direction='in'/>"
+    "      <arg type='u' direction='out'/>"
+    "    </method>"
+    "    <method name='CloseNotification'>"
+    "      <arg type='u' direction='in'/>"
+    "    </method>"
+    "    <signal name='NotificationClosed'>"
+    "      <arg type='u'/>"
+    "      <arg type='u'/>"
+    "    </signal>"
+    "    <signal name='ActionInvoked'>"
+    "      <arg type='u'/>"
+    "      <arg type='s'/>"
+    "    </signal>"
+    "  </interface>"
+    "</node>";
+
+static void notifications_bus_acquired(GDBusConnection *connection,
+                                       const gchar *name, gpointer data) {
+    (void)name;
+    NintyBar *bar = data;
+    static const GDBusInterfaceVTable vtable = {
+        notification_method_call, NULL, NULL, { 0 }
+    };
+    GError *error = NULL;
+
+    bar->notifications_connection = g_object_ref(connection);
+    bar->notifications_registration =
+        g_dbus_connection_register_object(
+            connection, "/org/freedesktop/Notifications",
+            bar->notifications_node->interfaces[0], &vtable, bar, NULL,
+            &error);
+    if (bar->notifications_registration == 0) {
+        g_warning("nintysh: cannot register notification service: %s",
+                  error != NULL ? error->message : "unknown error");
+        g_clear_error(&error);
+    }
+}
+
+static void notifications_name_acquired(GDBusConnection *connection,
+                                        const gchar *name,
+                                        gpointer user_data) {
+    (void)connection;
+    (void)name;
+    (void)user_data;
+}
+
+static void notifications_name_lost(GDBusConnection *connection,
+                                    const gchar *name, gpointer user_data) {
+    (void)connection;
+    (void)user_data;
+    g_warning("nintysh: notification name %s is already owned", name);
+}
+
+static void notifications_init(NintyBar *bar) {
+    GError *error = NULL;
+    bar->notifications_node =
+        g_dbus_node_info_new_for_xml(notification_xml, &error);
+    if (bar->notifications_node == NULL) {
+        g_warning("nintysh: invalid notification interface: %s",
+                  error != NULL ? error->message : "unknown error");
+        g_clear_error(&error);
+        return;
+    }
+    bar->notifications_bus = g_bus_own_name(
+        G_BUS_TYPE_SESSION, "org.freedesktop.Notifications",
+        G_BUS_NAME_OWNER_FLAGS_NONE, notifications_bus_acquired,
+        notifications_name_acquired, notifications_name_lost, bar, NULL);
+}
+
+static void notifications_free(NintyBar *bar) {
+    if (bar->notifications_bus != 0) {
+        g_bus_unown_name(bar->notifications_bus);
+        bar->notifications_bus = 0;
+    }
+    if (bar->notifications_connection != NULL) {
+        if (bar->notifications_registration != 0) {
+            g_dbus_connection_unregister_object(
+                bar->notifications_connection,
+                bar->notifications_registration);
+        }
+        g_object_unref(bar->notifications_connection);
+        bar->notifications_connection = NULL;
+        bar->notifications_registration = 0;
+    }
+    if (bar->notifications_node != NULL) {
+        g_dbus_node_info_unref(bar->notifications_node);
+        bar->notifications_node = NULL;
+    }
 }
 
 static gint app_compare(gconstpointer a, gconstpointer b) {
@@ -1230,14 +2048,18 @@ static gboolean menu_key_pressed(GtkEventControllerKey *controller,
 
 static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
                                   double screen_w, double screen_h) {
-    (void)bar;
     PanelFrame frame = { 0 };
 
     switch (kind) {
-    case PANEL_VOLUME:
-        frame.w = 252.0;
-        frame.h = 138.0;
+    case PANEL_VOLUME: {
+        int sinks = MAX(1, MIN((int)bar->audio_sinks->len,
+                               NINTYSH_AUDIO_MAX_ROWS));
+        int sources = MAX(1, MIN((int)bar->audio_sources->len,
+                                 NINTYSH_AUDIO_MAX_ROWS));
+        frame.w = 340.0;
+        frame.h = 240.0 + sinks * 20.0 + sources * 20.0;
         break;
+    }
     case PANEL_CALENDAR:
         frame.w = 260.0;
         frame.h = 224.0;
@@ -1257,6 +2079,14 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
     case PANEL_CLIPBOARD:
         frame.w = 320.0;
         frame.h = 260.0;
+        break;
+    case PANEL_NOTIFICATIONS:
+        frame.w = 360.0;
+        frame.h = 300.0;
+        break;
+    case PANEL_MEDIA:
+        frame.w = 320.0;
+        frame.h = 330.0;
         break;
     default:
         frame.w = 1.0;
@@ -1292,12 +2122,49 @@ static void panel_close_rect(const PanelFrame *frame, double *x, double *y,
     *y = frame->y + 4.0;
 }
 
-static void volume_track_rect(const PanelFrame *frame, double *x, double *y,
-                              double *w, double *h) {
+typedef struct {
+    double out_y;
+    double out_track_y;
+    double out_mute_y;
+    double out_list_y;
+    double out_rows_y;
+    int out_rows;
+    double in_y;
+    double in_track_y;
+    double in_mute_y;
+    double in_list_y;
+    double in_rows_y;
+    int in_rows;
+} AudioGeometry;
+
+static int audio_visible_rows(GPtrArray *devices) {
+    return MAX(1, MIN((int)devices->len, NINTYSH_AUDIO_MAX_ROWS));
+}
+
+static void audio_geometry(NintyBar *bar, const PanelFrame *frame,
+                           AudioGeometry *geometry) {
+    geometry->out_y = frame->y + frame->title_h + 6.0;
+    geometry->out_track_y = geometry->out_y + 44.0;
+    geometry->out_mute_y = geometry->out_y + 60.0;
+    geometry->out_list_y = geometry->out_y + 80.0;
+    geometry->out_rows_y = geometry->out_y + 96.0;
+    geometry->out_rows = audio_visible_rows(bar->audio_sinks);
+
+    geometry->in_y = geometry->out_rows_y +
+                     geometry->out_rows * 20.0 + 12.0;
+    geometry->in_track_y = geometry->in_y + 44.0;
+    geometry->in_mute_y = geometry->in_y + 60.0;
+    geometry->in_list_y = geometry->in_y + 80.0;
+    geometry->in_rows_y = geometry->in_y + 96.0;
+    geometry->in_rows = audio_visible_rows(bar->audio_sources);
+}
+
+static void audio_track_rect(const PanelFrame *frame, double y, double *x,
+                             double *w, double *h) {
     *x = frame->x + 16.0;
-    *y = frame->y + 76.0;
     *w = frame->w - 32.0;
     *h = 6.0;
+    (void)y;
 }
 
 static void draw_panel_frame(cairo_t *cr, const PanelFrame *frame,
@@ -1345,68 +2212,147 @@ static void draw_panel_frame(cairo_t *cr, const PanelFrame *frame,
     cairo_stroke(cr);
 }
 
-static void panel_draw_volume(cairo_t *cr, NintyBar *bar,
-                              const PanelFrame *frame) {
-    char percent_text[64];
-    if (bar->volume_muted) {
-        g_snprintf(percent_text, sizeof(percent_text), "Muted  %d%%",
-                   bar->volume_percent);
-    } else {
-        g_snprintf(percent_text, sizeof(percent_text), "%d%%",
-                   bar->volume_percent);
-    }
-
-    cairo_save(cr);
-    cairo_translate(cr, frame->x + 12.0, frame->y + 28.0);
-    cairo_scale(cr, 2.0, 2.0);
-    win98_draw_volume_icon(cr, 0, 0, bar->volume_muted);
-    cairo_restore(cr);
-
-    win98_draw_text(cr, frame->x + 54.0, frame->y + 28.0,
-                    frame->w - 68.0, 18.0, "Volume", WIN98_ALIGN_LEFT, TRUE,
-                    win98_text, FALSE);
-    win98_draw_text(cr, frame->x + 54.0, frame->y + 46.0,
-                    frame->w - 68.0, 18.0, percent_text, WIN98_ALIGN_RIGHT,
-                    FALSE, win98_text, FALSE);
-
+static void audio_draw_slider(cairo_t *cr, const PanelFrame *frame,
+                              double y, int percent) {
     double tx = 0;
-    double ty = 0;
     double tw = 0;
     double th = 0;
-    volume_track_rect(frame, &tx, &ty, &tw, &th);
+    audio_track_rect(frame, y, &tx, &tw, &th);
 
-    win98_fill(cr, tx, ty, tw, th, win98_light);
-    win98_bevel(cr, tx, ty, tw, th, WIN98_BEVEL_SUNKEN);
-    win98_fill(cr, tx + 2.0, ty + 2.0, tw - 4.0, 2.0, win98_shadow);
-    win98_fill(cr, tx + 2.0, ty + th - 3.0, tw - 4.0, 1.0, win98_white);
+    win98_fill(cr, tx, y, tw, th, win98_light);
+    win98_bevel(cr, tx, y, tw, th, WIN98_BEVEL_SUNKEN);
+    win98_fill(cr, tx + 2.0, y + 2.0, tw - 4.0, 2.0, win98_shadow);
+    win98_fill(cr, tx + 2.0, y + th - 3.0, tw - 4.0, 1.0, win98_white);
 
     double usable = tw - 16.0;
-    double fraction = CLAMP(bar->volume_percent / 100.0, 0.0, 1.0);
+    double fraction = CLAMP(percent / 100.0, 0.0, 1.0);
     double thumb_x = tx + 2.0 + usable * fraction;
-    win98_fill(cr, thumb_x, ty - 6.0, 12.0, 18.0, win98_face);
-    win98_bevel(cr, thumb_x, ty - 6.0, 12.0, 18.0, WIN98_BEVEL_RAISED);
-    win98_fill(cr, thumb_x + 5.0, ty - 2.0, 2.0, 10.0, win98_shadow);
+    win98_fill(cr, thumb_x, y - 6.0, 12.0, 18.0, win98_face);
+    win98_bevel(cr, thumb_x, y - 6.0, 12.0, 18.0, WIN98_BEVEL_RAISED);
+    win98_fill(cr, thumb_x + 5.0, y - 2.0, 2.0, 10.0, win98_shadow);
 
     for (int i = 0; i <= 10; i++) {
         double tick_x = tx + 2.0 + (tw - 4.0) * i / 10.0;
         double tick_h = (i % 5 == 0) ? 5.0 : 3.0;
-        win98_fill(cr, tick_x, ty + th + 3.0, 1.0, tick_h, win98_shadow);
+        win98_fill(cr, tick_x, y + th + 3.0, 1.0, tick_h, win98_shadow);
     }
+}
 
+static void audio_draw_mute(cairo_t *cr, const PanelFrame *frame, double y,
+                            gboolean muted) {
     double cbx = frame->x + 16.0;
-    double cby = frame->y + frame->h - 26.0;
-    win98_fill(cr, cbx, cby, 13.0, 13.0, win98_white);
-    win98_bevel(cr, cbx, cby, 13.0, 13.0, WIN98_BEVEL_SUNKEN);
-    if (bar->volume_muted) {
+    win98_fill(cr, cbx, y, 13.0, 13.0, win98_white);
+    win98_bevel(cr, cbx, y, 13.0, 13.0, WIN98_BEVEL_SUNKEN);
+    if (muted) {
         cairo_set_source_rgb(cr, 0, 0, 0);
         cairo_set_line_width(cr, 2.0);
-        cairo_move_to(cr, cbx + 3.0, cby + 4.0);
-        cairo_line_to(cr, cbx + 5.5, cby + 7.0);
-        cairo_line_to(cr, cbx + 10.0, cby + 2.0);
+        cairo_move_to(cr, cbx + 3.0, y + 4.0);
+        cairo_line_to(cr, cbx + 5.5, y + 7.0);
+        cairo_line_to(cr, cbx + 10.0, y + 2.0);
         cairo_stroke(cr);
     }
-    win98_draw_text(cr, cbx + 19.0, cby - 2.0, frame->w - 44.0, 17.0,
+    win98_draw_text(cr, cbx + 19.0, y - 2.0, frame->w - 44.0, 17.0,
                     "Mute", WIN98_ALIGN_LEFT, FALSE, win98_text, FALSE);
+}
+
+static void audio_draw_header(cairo_t *cr, const PanelFrame *frame, double y,
+                              const char *title, const char *device,
+                              int percent, gboolean muted,
+                              gboolean available) {
+    char percent_text[64];
+    if (!available) {
+        g_snprintf(percent_text, sizeof(percent_text), "--");
+    } else if (muted) {
+        g_snprintf(percent_text, sizeof(percent_text), "Muted  %d%%",
+                   percent);
+    } else {
+        g_snprintf(percent_text, sizeof(percent_text), "%d%%", percent);
+    }
+
+    cairo_save(cr);
+    cairo_translate(cr, frame->x + 12.0, y + 2.0);
+    cairo_scale(cr, 2.0, 2.0);
+    win98_draw_volume_icon(cr, 0, 0, muted);
+    cairo_restore(cr);
+
+    win98_draw_text(cr, frame->x + 54.0, y, frame->w - 120.0, 18.0, title,
+                    WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
+    win98_draw_text(cr, frame->x + frame->w - 74.0, y, 58.0, 18.0,
+                    percent_text, WIN98_ALIGN_RIGHT, FALSE, win98_text,
+                    FALSE);
+    win98_draw_text(cr, frame->x + 54.0, y + 18.0, frame->w - 68.0, 17.0,
+                    device != NULL ? device : "No device",
+                    WIN98_ALIGN_LEFT, FALSE, win98_text, TRUE);
+}
+
+static void audio_draw_devices(cairo_t *cr, const PanelFrame *frame,
+                               double label_y, double rows_y,
+                               GPtrArray *devices, int rows,
+                               const char *label, const char *empty_text) {
+    win98_draw_text(cr, frame->x + 16.0, label_y, frame->w - 32.0, 14.0,
+                    label, WIN98_ALIGN_LEFT, FALSE, win98_text_disabled,
+                    FALSE);
+
+    for (int row = 0; row < rows; row++) {
+        double y = rows_y + row * 20.0;
+        if (devices->len == 0) {
+            if (row == 0) {
+                win98_draw_text(cr, frame->x + 16.0, y, frame->w - 32.0,
+                                20.0, empty_text, WIN98_ALIGN_LEFT, FALSE,
+                                win98_text_disabled, TRUE);
+            }
+            break;
+        }
+        if ((guint)row >= devices->len) {
+            break;
+        }
+        AudioDevice *device = g_ptr_array_index(devices, (guint)row);
+        if (device->is_default) {
+            win98_fill(cr, frame->x + 16.0, y + 6.0, 7.0, 7.0, win98_navy);
+        } else {
+            win98_fill(cr, frame->x + 16.0, y + 6.0, 7.0, 7.0, win98_white);
+            win98_bevel(cr, frame->x + 16.0, y + 6.0, 7.0, 7.0,
+                        WIN98_BEVEL_SUNKEN);
+        }
+        win98_draw_text(cr, frame->x + 28.0, y, frame->w - 44.0, 20.0,
+                        device->label, WIN98_ALIGN_LEFT,
+                        device->is_default, win98_text, TRUE);
+    }
+}
+
+static void panel_draw_volume(cairo_t *cr, NintyBar *bar,
+                              const PanelFrame *frame) {
+    AudioGeometry geometry;
+    audio_geometry(bar, frame, &geometry);
+
+    audio_draw_header(cr, frame, geometry.out_y, "Output",
+                      audio_default_label(bar->audio_sinks),
+                      bar->volume_percent, bar->volume_muted,
+                      bar->volume_available);
+    audio_draw_slider(cr, frame, geometry.out_track_y,
+                      bar->volume_percent);
+    audio_draw_mute(cr, frame, geometry.out_mute_y, bar->volume_muted);
+    audio_draw_devices(cr, frame, geometry.out_list_y,
+                       geometry.out_rows_y, bar->audio_sinks,
+                       geometry.out_rows, "Output devices",
+                       "No output devices");
+
+    win98_fill(cr, frame->x + 16.0, geometry.in_y - 6.0,
+               frame->w - 32.0, 1.0, win98_shadow);
+    win98_fill(cr, frame->x + 16.0, geometry.in_y - 5.0,
+               frame->w - 32.0, 1.0, win98_highlight);
+
+    audio_draw_header(cr, frame, geometry.in_y, "Microphone",
+                      audio_default_label(bar->audio_sources),
+                      bar->source_percent, bar->source_muted,
+                      bar->source_available);
+    audio_draw_slider(cr, frame, geometry.in_track_y,
+                      bar->source_percent);
+    audio_draw_mute(cr, frame, geometry.in_mute_y, bar->source_muted);
+    audio_draw_devices(cr, frame, geometry.in_list_y,
+                       geometry.in_rows_y, bar->audio_sources,
+                       geometry.in_rows, "Input devices",
+                       "No input devices");
 }
 
 static void calendar_nav_rects(const PanelFrame *frame, double *prev_x,
@@ -1621,6 +2567,244 @@ static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
     }
 }
 
+static int notification_rows(const PanelFrame *frame) {
+    return (int)((frame->h - frame->title_h - 16.0) /
+                 NINTYSH_NOTIFICATION_ROW_HEIGHT);
+}
+
+static int notification_row_at(const PanelFrame *frame, double y) {
+    double list_y = frame->y + frame->title_h + 8.0;
+    if (y < list_y) {
+        return -1;
+    }
+    int row = (int)((y - list_y) / NINTYSH_NOTIFICATION_ROW_HEIGHT);
+    return row < notification_rows(frame) ? row : -1;
+}
+
+static void panel_draw_notifications(cairo_t *cr, NintyBar *bar,
+                                     const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Notifications");
+
+    double list_x = frame->x + 8.0;
+    double list_y = frame->y + frame->title_h + 8.0;
+    double list_w = frame->w - 24.0;
+    int rows = notification_rows(frame);
+    int count = (int)bar->notifications->len;
+    int max_scroll = MAX(0, count - rows);
+    bar->notification_scroll =
+        CLAMP(bar->notification_scroll, 0, max_scroll);
+
+    if (count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w,
+                        NINTYSH_NOTIFICATION_ROW_HEIGHT,
+                        "No notifications", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
+    }
+
+    for (int row = 0; row < rows; row++) {
+        int index = bar->notification_scroll + row;
+        if (index >= count) {
+            break;
+        }
+        NintyNotification *notification =
+            g_ptr_array_index(bar->notifications, (guint)index);
+        double y = list_y + row * NINTYSH_NOTIFICATION_ROW_HEIGHT;
+        gboolean selected = index == bar->panel_hover;
+        if (selected) {
+            win98_fill(cr, list_x, y, list_w,
+                       NINTYSH_NOTIFICATION_ROW_HEIGHT, win98_navy);
+        }
+        win98_draw_text(cr, list_x + 4.0, y + 1.0, list_w - 8.0, 16.0,
+                        notification->summary, WIN98_ALIGN_LEFT, TRUE,
+                        selected ? win98_white : win98_text, TRUE);
+        char detail[512];
+        const char *app = notification->app_name != NULL
+                              ? notification->app_name
+                              : "Notification";
+        if (notification->body != NULL && notification->body[0] != '\0') {
+            g_snprintf(detail, sizeof(detail), "%s: %s", app,
+                       notification->body);
+        } else {
+            g_snprintf(detail, sizeof(detail), "%s", app);
+        }
+        win98_draw_text(cr, list_x + 4.0, y + 16.0, list_w - 8.0, 15.0,
+                        detail, WIN98_ALIGN_LEFT, FALSE,
+                        selected ? win98_white : win98_text_disabled, TRUE);
+    }
+
+    if (max_scroll > 0) {
+        double sx = frame->x + frame->w - 14.0;
+        double sy = list_y;
+        double sh = frame->h - frame->title_h - 16.0;
+        win98_fill(cr, sx, sy, 12.0, sh, win98_light);
+        win98_bevel(cr, sx, sy, 12.0, sh, WIN98_BEVEL_SUNKEN);
+        double track_y = sy + 12.0;
+        double track_h = sh - 24.0;
+        double thumb_h = MAX(16.0, track_h * rows / count);
+        thumb_h = MIN(thumb_h, track_h);
+        double fraction = (double)bar->notification_scroll / max_scroll;
+        double thumb_y = track_y + (track_h - thumb_h) * fraction;
+        win98_fill(cr, sx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
+        win98_bevel(cr, sx + 1.0, thumb_y, 10.0, thumb_h,
+                    WIN98_BEVEL_RAISED);
+    }
+}
+
+static void media_progress_rect(const PanelFrame *frame, double *x,
+                                double *y, double *w, double *h) {
+    *x = frame->x + 16.0;
+    *y = frame->y + 236.0;
+    *w = frame->w - 32.0;
+    *h = 8.0;
+}
+
+static void media_control_rects(const PanelFrame *frame, double *prev_x,
+                                double *play_x, double *next_x, double *y,
+                                double *w, double *h) {
+    *w = 58.0;
+    *h = 28.0;
+    *y = frame->y + 272.0;
+    double gap = 10.0;
+    double total = *w * 3.0 + gap * 2.0;
+    double start = frame->x + (frame->w - total) / 2.0;
+    *prev_x = start;
+    *play_x = start + *w + gap;
+    *next_x = start + 2.0 * (*w + gap);
+}
+
+static void format_media_time(gint64 microseconds, char *buffer,
+                              gsize size) {
+    if (microseconds < 0) {
+        microseconds = 0;
+    }
+    gint64 seconds = microseconds / 1000000;
+    g_snprintf(buffer, size, "%" G_GINT64_FORMAT ":%02" G_GINT64_FORMAT,
+               seconds / 60, seconds % 60);
+}
+
+static void panel_draw_media(cairo_t *cr, NintyBar *bar,
+                             const PanelFrame *frame) {
+    const MprisState *state = mpris_client_state(bar->mpris);
+    double art_size = 128.0;
+    double art_x = frame->x + (frame->w - art_size) / 2.0;
+    double art_y = frame->y + frame->title_h + 14.0;
+
+    if (state == NULL || !state->available) {
+        win98_fill(cr, art_x, art_y, art_size, art_size, win98_face);
+        win98_bevel(cr, art_x, art_y, art_size, art_size,
+                    WIN98_BEVEL_SUNKEN);
+        cairo_save(cr);
+        cairo_translate(cr, art_x + 32.0, art_y + 32.0);
+        cairo_scale(cr, 4.0, 4.0);
+        win98_draw_media_icon(cr, 0, 0, FALSE);
+        cairo_restore(cr);
+        win98_draw_text(cr, frame->x + 16.0, art_y + art_size + 14.0,
+                        frame->w - 32.0, 20.0, "No MPRIS player",
+                        WIN98_ALIGN_CENTER, TRUE, win98_text, FALSE);
+        win98_draw_text(cr, frame->x + 16.0, art_y + art_size + 36.0,
+                        frame->w - 32.0, 18.0,
+                        "Start a supported media player",
+                        WIN98_ALIGN_CENTER, FALSE, win98_text_disabled,
+                        TRUE);
+        return;
+    }
+
+    update_media_art(bar);
+    if (bar->media_art != NULL) {
+        draw_gdk_paintable(cr, GDK_PAINTABLE(bar->media_art), art_x, art_y,
+                           art_size);
+    } else {
+        win98_fill(cr, art_x, art_y, art_size, art_size, win98_face);
+        win98_bevel(cr, art_x, art_y, art_size, art_size,
+                    WIN98_BEVEL_SUNKEN);
+        cairo_save(cr);
+        cairo_translate(cr, art_x + 32.0, art_y + 32.0);
+        cairo_scale(cr, 4.0, 4.0);
+        win98_draw_media_icon(cr, 0, 0,
+                              g_strcmp0(state->status, "Playing") == 0);
+        cairo_restore(cr);
+    }
+
+    double text_y = art_y + art_size + 12.0;
+    const char *title = state->title != NULL && state->title[0] != '\0'
+                            ? state->title
+                            : "Unknown track";
+    const char *artist = state->artist != NULL && state->artist[0] != '\0'
+                             ? state->artist
+                             : (state->identity != NULL ? state->identity
+                                                        : "");
+    win98_draw_text(cr, frame->x + 16.0, text_y, frame->w - 32.0, 20.0,
+                    title, WIN98_ALIGN_CENTER, TRUE, win98_text, TRUE);
+    win98_draw_text(cr, frame->x + 16.0, text_y + 20.0, frame->w - 32.0,
+                    18.0, artist, WIN98_ALIGN_CENTER, FALSE, win98_text,
+                    TRUE);
+    win98_draw_text(cr, frame->x + 16.0, text_y + 38.0, frame->w - 32.0,
+                    18.0,
+                    state->album != NULL ? state->album : "",
+                    WIN98_ALIGN_CENTER, FALSE, win98_text_disabled, TRUE);
+
+    double px = 0;
+    double py = 0;
+    double pw = 0;
+    double ph = 0;
+    media_progress_rect(frame, &px, &py, &pw, &ph);
+    win98_fill(cr, px, py, pw, ph, win98_light);
+    win98_bevel(cr, px, py, pw, ph, WIN98_BEVEL_SUNKEN);
+
+    double fraction = 0.0;
+    if (state->length_us > 0) {
+        fraction = CLAMP(state->position_us / (double)state->length_us,
+                         0.0, 1.0);
+    }
+    double filled = (pw - 4.0) * fraction;
+    if (filled > 0.0) {
+        win98_fill(cr, px + 2.0, py + 2.0, filled, ph - 4.0, win98_navy);
+    }
+    double thumb_x = px + 2.0 + filled;
+    win98_fill(cr, thumb_x - 3.0, py - 2.0, 7.0, ph + 4.0, win98_face);
+    win98_bevel(cr, thumb_x - 3.0, py - 2.0, 7.0, ph + 4.0,
+                WIN98_BEVEL_RAISED);
+
+    char elapsed[32];
+    char duration[32];
+    format_media_time(state->position_us, elapsed, sizeof(elapsed));
+    format_media_time(state->length_us, duration, sizeof(duration));
+    win98_draw_text(cr, frame->x + 16.0, py + 10.0, frame->w - 32.0,
+                    16.0, elapsed, WIN98_ALIGN_LEFT, FALSE, win98_text,
+                    FALSE);
+    win98_draw_text(cr, frame->x + 16.0, py + 10.0, frame->w - 32.0,
+                    16.0, duration, WIN98_ALIGN_RIGHT, FALSE, win98_text,
+                    FALSE);
+
+    double prev_x = 0;
+    double play_x = 0;
+    double next_x = 0;
+    double controls_y = 0;
+    double controls_w = 0;
+    double controls_h = 0;
+    media_control_rects(frame, &prev_x, &play_x, &next_x, &controls_y,
+                        &controls_w, &controls_h);
+
+    gboolean playing = g_strcmp0(state->status, "Playing") == 0;
+    const char *labels[3] = { "Prev", playing ? "Pause" : "Play", "Next" };
+    gboolean enabled[3] = {
+        state->can_go_previous,
+        playing ? state->can_pause : state->can_play,
+        state->can_go_next,
+    };
+    double xs[3] = { prev_x, play_x, next_x };
+    for (int i = 0; i < 3; i++) {
+        win98_fill(cr, xs[i], controls_y, controls_w, controls_h,
+                   win98_face);
+        win98_bevel(cr, xs[i], controls_y, controls_w, controls_h,
+                    WIN98_BEVEL_RAISED);
+        win98_draw_text(cr, xs[i], controls_y, controls_w, controls_h,
+                        labels[i], WIN98_ALIGN_CENTER, TRUE,
+                        enabled[i] ? win98_text : win98_text_disabled,
+                        FALSE);
+    }
+}
+
 static const char *task_menu_items[] = {
     "Focus", "Toggle Floating", "Fullscreen", NULL, "Close"
 };
@@ -1689,7 +2873,7 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
 
     switch (bar->panel_kind) {
     case PANEL_VOLUME:
-        draw_panel_frame(cr, &frame, "Volume");
+        draw_panel_frame(cr, &frame, "Audio");
         panel_draw_volume(cr, bar, &frame);
         break;
     case PANEL_CALENDAR:
@@ -1707,23 +2891,36 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     case PANEL_CLIPBOARD:
         panel_draw_clipboard(cr, bar, &frame);
         break;
+    case PANEL_NOTIFICATIONS:
+        panel_draw_notifications(cr, bar, &frame);
+        break;
+    case PANEL_MEDIA:
+        panel_draw_media(cr, bar, &frame);
+        break;
     default:
         break;
     }
 }
 
-static int volume_percent_from_x(const PanelFrame *frame, double x) {
-    double tx = 0;
-    double ty = 0;
-    double tw = 0;
-    double th = 0;
-    (void)ty;
-    (void)th;
-    volume_track_rect(frame, &tx, &ty, &tw, &th);
-
+static int audio_percent_from_x(const PanelFrame *frame, double x) {
+    double tw = frame->w - 32.0;
+    double tx = frame->x + 16.0;
     double usable = tw - 16.0;
     double fraction = (x - (tx + 2.0)) / usable;
     return CLAMP((int)round(fraction * 100.0), 0, 100);
+}
+
+static int audio_device_row_at(GPtrArray *devices, double rows_y,
+                               double y) {
+    if (y < rows_y) {
+        return -1;
+    }
+    int row = (int)((y - rows_y) / 20.0);
+    if (row < 0 || (guint)row >= devices->len ||
+        row >= NINTYSH_AUDIO_MAX_ROWS) {
+        return -1;
+    }
+    return row;
 }
 
 static void open_panel(NintyBar *bar, PanelKind kind) {
@@ -1734,6 +2931,21 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     close_menu(bar);
     if (kind == PANEL_CLIPBOARD) {
         bar->clipboard_scroll = 0;
+        bar->panel_hover = -1;
+    }
+    if (kind == PANEL_NOTIFICATIONS) {
+        bar->notification_scroll = 0;
+        bar->panel_hover = -1;
+    }
+    if (kind == PANEL_VOLUME) {
+        update_audio_devices(bar);
+        update_volume(bar);
+        update_source(bar);
+        bar->panel_hover = -1;
+    }
+    if (kind == PANEL_MEDIA) {
+        mpris_client_poll(bar->mpris);
+        update_media_art(bar);
         bar->panel_hover = -1;
     }
     if (kind == PANEL_CALENDAR) {
@@ -1780,6 +2992,11 @@ static void close_panel(NintyBar *bar) {
     bar_queue_redraw(bar);
 }
 
+static gboolean rect_contains(double px, double py, double x, double y,
+                              double w, double h) {
+    return px >= x && px < x + w && py >= y && py < y + h;
+}
+
 static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
                           double y, gpointer user_data) {
     (void)gesture;
@@ -1812,6 +3029,16 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         return;
     }
 
+    double cx = 0;
+    double cy = 0;
+    double cw = 0;
+    double ch = 0;
+    panel_close_rect(&frame, &cx, &cy, &cw, &ch);
+    if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) {
+        close_panel(bar);
+        return;
+    }
+
     if (bar->panel_kind == PANEL_CLIPBOARD) {
         int row = clipboard_row_at(&frame, y);
         double list_x = frame.x + 8.0;
@@ -1827,33 +3054,115 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
         return;
     }
 
-    double cx = 0;
-    double cy = 0;
-    double cw = 0;
-    double ch = 0;
-    panel_close_rect(&frame, &cx, &cy, &cw, &ch);
-    if (x >= cx && x < cx + cw && y >= cy && y < cy + ch) {
-        close_panel(bar);
+    if (bar->panel_kind == PANEL_NOTIFICATIONS) {
+        int row = notification_row_at(&frame, y);
+        double list_x = frame.x + 8.0;
+        double list_w = frame.w - 24.0;
+        if (row >= 0 && x >= list_x && x < list_x + list_w) {
+            int index = bar->notification_scroll + row;
+            if (index < (int)bar->notifications->len) {
+                notification_remove_at(bar, (guint)index, 3);
+            }
+        }
+        return;
+    }
+
+    if (bar->panel_kind == PANEL_MEDIA) {
+        const MprisState *state = mpris_client_state(bar->mpris);
+        if (state == NULL || !state->available) {
+            return;
+        }
+
+        double prev_x = 0;
+        double play_x = 0;
+        double next_x = 0;
+        double controls_y = 0;
+        double controls_w = 0;
+        double controls_h = 0;
+        media_control_rects(&frame, &prev_x, &play_x, &next_x,
+                            &controls_y, &controls_w, &controls_h);
+        if (rect_contains(x, y, prev_x, controls_y, controls_w,
+                          controls_h)) {
+            mpris_client_previous(bar->mpris);
+        } else if (rect_contains(x, y, play_x, controls_y, controls_w,
+                                 controls_h)) {
+            mpris_client_play_pause(bar->mpris);
+        } else if (rect_contains(x, y, next_x, controls_y, controls_w,
+                                 controls_h)) {
+            mpris_client_next(bar->mpris);
+        } else {
+            double px = 0;
+            double py = 0;
+            double pw = 0;
+            double ph = 0;
+            media_progress_rect(&frame, &px, &py, &pw, &ph);
+            if (x >= px - 6.0 && x < px + pw + 6.0 &&
+                y >= py - 8.0 && y < py + ph + 8.0 &&
+                state->length_us > 0 && state->can_seek) {
+                double fraction = CLAMP((x - (px + 2.0)) / (pw - 4.0),
+                                        0.0, 1.0);
+                mpris_client_set_position(
+                    bar->mpris, (gint64)(state->length_us * fraction));
+            }
+        }
+
+        mpris_client_poll(bar->mpris);
+        update_media_art(bar);
+        gtk_widget_queue_draw(bar->panel_area);
         return;
     }
 
     if (bar->panel_kind == PANEL_VOLUME) {
-        double cbx = frame.x + 16.0;
-        double cby = frame.y + frame.h - 26.0;
-        if (x >= cbx - 2.0 && x < cbx + 16.0 && y >= cby - 2.0 &&
-            y < cby + 16.0) {
+        AudioGeometry geometry;
+        audio_geometry(bar, &frame, &geometry);
+
+        double mute_x = frame.x + 16.0;
+        if (rect_contains(x, y, mute_x - 2.0, geometry.out_mute_y - 2.0,
+                          18.0, 18.0)) {
             toggle_volume(bar);
+            return;
+        }
+        if (rect_contains(x, y, mute_x - 2.0, geometry.in_mute_y - 2.0,
+                          18.0, 18.0)) {
+            toggle_source(bar);
             return;
         }
 
         double tx = 0;
-        double ty = 0;
         double tw = 0;
         double th = 0;
-        volume_track_rect(&frame, &tx, &ty, &tw, &th);
-        if (x >= tx - 6.0 && x < tx + tw + 6.0 && y >= ty - 12.0 &&
-            y < ty + th + 14.0) {
-            apply_volume(bar, volume_percent_from_x(&frame, x), TRUE);
+        audio_track_rect(&frame, geometry.out_track_y, &tx, &tw, &th);
+        if (x >= tx - 6.0 && x < tx + tw + 6.0 &&
+            y >= geometry.out_track_y - 12.0 &&
+            y < geometry.out_track_y + th + 14.0) {
+            apply_volume(bar, audio_percent_from_x(&frame, x), TRUE);
+            return;
+        }
+        audio_track_rect(&frame, geometry.in_track_y, &tx, &tw, &th);
+        if (x >= tx - 6.0 && x < tx + tw + 6.0 &&
+            y >= geometry.in_track_y - 12.0 &&
+            y < geometry.in_track_y + th + 14.0) {
+            apply_source_volume(bar, audio_percent_from_x(&frame, x), TRUE);
+            return;
+        }
+
+        if (x >= frame.x + 16.0 && x < frame.x + frame.w - 16.0) {
+            int row = audio_device_row_at(bar->audio_sinks,
+                                          geometry.out_rows_y, y);
+            if (row >= 0) {
+                AudioDevice *device =
+                    g_ptr_array_index(bar->audio_sinks, (guint)row);
+                set_default_audio_device(bar, device->id, FALSE);
+                return;
+            }
+            row = audio_device_row_at(bar->audio_sources,
+                                      geometry.in_rows_y, y);
+            if (row >= 0) {
+                AudioDevice *device =
+                    g_ptr_array_index(bar->audio_sources, (guint)row);
+                set_default_audio_device(bar, device->id, TRUE);
+                return;
+            }
         }
     } else if (bar->panel_kind == PANEL_CALENDAR) {
         double prev_x = 0;
@@ -1889,7 +3198,6 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
 static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
                              double start_y, gpointer user_data) {
     (void)gesture;
-    (void)start_y;
     NintyBar *bar = user_data;
     if (bar->panel_kind != PANEL_VOLUME) {
         return;
@@ -1898,15 +3206,28 @@ static void panel_drag_begin(GtkGestureDrag *gesture, double start_x,
     double width = gtk_widget_get_width(bar->panel_area);
     double height = gtk_widget_get_height(bar->panel_area);
     PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
+    AudioGeometry geometry;
+    audio_geometry(bar, &frame, &geometry);
+
     double tx = 0;
-    double ty = 0;
     double tw = 0;
     double th = 0;
-    volume_track_rect(&frame, &tx, &ty, &tw, &th);
-
+    audio_track_rect(&frame, geometry.out_track_y, &tx, &tw, &th);
     if (start_x >= tx - 6.0 && start_x < tx + tw + 6.0 &&
-        start_y >= ty - 12.0 && start_y < ty + th + 14.0) {
+        start_y >= geometry.out_track_y - 12.0 &&
+        start_y < geometry.out_track_y + th + 14.0) {
         bar->volume_dragging = TRUE;
+        bar->volume_drag_source = FALSE;
+        bar->volume_drag_x0 = start_x;
+        return;
+    }
+
+    audio_track_rect(&frame, geometry.in_track_y, &tx, &tw, &th);
+    if (start_x >= tx - 6.0 && start_x < tx + tw + 6.0 &&
+        start_y >= geometry.in_track_y - 12.0 &&
+        start_y < geometry.in_track_y + th + 14.0) {
+        bar->volume_dragging = TRUE;
+        bar->volume_drag_source = TRUE;
         bar->volume_drag_x0 = start_x;
     }
 }
@@ -1923,9 +3244,13 @@ static void panel_drag_update(GtkGestureDrag *gesture, double offset_x,
     double width = gtk_widget_get_width(bar->panel_area);
     double height = gtk_widget_get_height(bar->panel_area);
     PanelFrame frame = panel_frame_for(bar, PANEL_VOLUME, width, height);
-    int percent =
-        volume_percent_from_x(&frame, bar->volume_drag_x0 + offset_x);
-    apply_volume(bar, percent, FALSE);
+    int percent = audio_percent_from_x(
+        &frame, bar->volume_drag_x0 + offset_x);
+    if (bar->volume_drag_source) {
+        apply_source_volume(bar, percent, FALSE);
+    } else {
+        apply_volume(bar, percent, FALSE);
+    }
 }
 
 static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
@@ -1938,7 +3263,11 @@ static void panel_drag_end(GtkGestureDrag *gesture, double offset_x,
         return;
     }
     bar->volume_dragging = FALSE;
-    apply_volume(bar, bar->volume_percent, TRUE);
+    if (bar->volume_drag_source) {
+        apply_source_volume(bar, bar->source_percent, TRUE);
+    } else {
+        apply_volume(bar, bar->volume_percent, TRUE);
+    }
 }
 
 static void panel_motion(GtkEventControllerMotion *controller, double x,
@@ -1947,7 +3276,8 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
     (void)x;
     NintyBar *bar = user_data;
     if (bar->panel_kind != PANEL_TASKMENU &&
-        bar->panel_kind != PANEL_CLIPBOARD) {
+        bar->panel_kind != PANEL_CLIPBOARD &&
+        bar->panel_kind != PANEL_NOTIFICATIONS) {
         return;
     }
 
@@ -1955,9 +3285,14 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
     double height = gtk_widget_get_height(bar->panel_area);
     PanelFrame frame =
         panel_frame_for(bar, bar->panel_kind, width, height);
-    int hover = bar->panel_kind == PANEL_TASKMENU
-                    ? task_menu_row_at(&frame, y)
-                    : clipboard_row_at(&frame, y);
+    int hover = -1;
+    if (bar->panel_kind == PANEL_TASKMENU) {
+        hover = task_menu_row_at(&frame, y);
+    } else if (bar->panel_kind == PANEL_CLIPBOARD) {
+        hover = clipboard_row_at(&frame, y);
+    } else {
+        hover = notification_row_at(&frame, y);
+    }
     if (hover != bar->panel_hover) {
         bar->panel_hover = hover;
         gtk_widget_queue_draw(bar->panel_area);
@@ -1969,7 +3304,12 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
     (void)controller;
     (void)dx;
     NintyBar *bar = user_data;
-    if (bar->panel_kind == PANEL_VOLUME) {
+    if (bar->panel_kind == PANEL_MEDIA) {
+        gint64 offset = dy > 0 ? -5000000 : 5000000;
+        mpris_client_seek(bar->mpris, offset);
+        mpris_client_poll(bar->mpris);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (bar->panel_kind == PANEL_VOLUME) {
         int delta = dy > 0 ? -2 : 2;
         apply_volume(bar, bar->volume_percent + delta, TRUE);
     } else if (bar->panel_kind == PANEL_CLIPBOARD) {
@@ -1981,6 +3321,17 @@ static gboolean panel_scrolled(GtkEventControllerScroll *controller,
         int step = dy > 0 ? 3 : -3;
         bar->clipboard_scroll =
             CLAMP(bar->clipboard_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (bar->panel_kind == PANEL_NOTIFICATIONS) {
+        double width = gtk_widget_get_width(bar->panel_area);
+        double height = gtk_widget_get_height(bar->panel_area);
+        PanelFrame frame =
+            panel_frame_for(bar, PANEL_NOTIFICATIONS, width, height);
+        int max_scroll = MAX(0, (int)bar->notifications->len -
+                                   notification_rows(&frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->notification_scroll =
+            CLAMP(bar->notification_scroll + step, 0, max_scroll);
         gtk_widget_queue_draw(bar->panel_area);
     }
     return TRUE;
@@ -2008,7 +3359,7 @@ static gboolean osd_hide_cb(gpointer user_data) {
     return G_SOURCE_REMOVE;
 }
 
-static void osd_present(NintyBar *bar) {
+static void osd_present_timeout(NintyBar *bar, guint timeout) {
     if (bar->osd_source != 0) {
         g_source_remove(bar->osd_source);
         bar->osd_source = 0;
@@ -2016,7 +3367,11 @@ static void osd_present(NintyBar *bar) {
     gtk_widget_set_visible(bar->osd_window, TRUE);
     gtk_window_present(GTK_WINDOW(bar->osd_window));
     gtk_widget_queue_draw(bar->osd_area);
-    bar->osd_source = g_timeout_add(NINTYSH_OSD_TIMEOUT_MS, osd_hide_cb, bar);
+    bar->osd_source = g_timeout_add(timeout, osd_hide_cb, bar);
+}
+
+static void osd_present(NintyBar *bar) {
+    osd_present_timeout(bar, NINTYSH_OSD_TIMEOUT_MS);
 }
 
 static void osd_show_volume(NintyBar *bar) {
@@ -2031,12 +3386,17 @@ static void osd_show_volume(NintyBar *bar) {
     osd_present(bar);
 }
 
-static void osd_show_text(NintyBar *bar, const char *text) {
+static void osd_show_text_timeout(NintyBar *bar, const char *text,
+                                  guint timeout) {
     g_strlcpy(bar->osd_text, text != NULL ? text : "",
               sizeof(bar->osd_text));
     bar->osd_value = -1;
     bar->osd_mute = FALSE;
-    osd_present(bar);
+    osd_present_timeout(bar, timeout);
+}
+
+static void osd_show_text(NintyBar *bar, const char *text) {
+    osd_show_text_timeout(bar, text, NINTYSH_OSD_TIMEOUT_MS);
 }
 
 static void osd_draw(GtkDrawingArea *area, cairo_t *cr, int width,
@@ -2168,7 +3528,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     int layout_w = (layout_name != NULL && layout_name[0] != '\0')
                        ? MAX(20, win98_text_width(layout_name, TRUE) + 8)
                        : 0;
-    double tray_w = 4.0 + 20.0 + 20.0 + 20.0 +
+    double tray_w = 4.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 +
                     (bar->battery_available ? 20.0 : 0.0) + layout_w + 4.0 +
                     clock_w + 4.0;
     double tray_x = w - 2.0 - tray_w;
@@ -2286,6 +3646,20 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     bar_add_hit(bar, HIT_CLIPBOARD, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
+    win98_draw_notification_icon(cr, icon_x, icon_y,
+                                 bar->notifications->len > 0);
+    bar_add_hit(bar, HIT_NOTIFICATIONS, icon_x - 1.0, icon_y, 18.0, 16.0,
+                0);
+    icon_x += 20.0;
+
+    const MprisState *media = mpris_client_state(bar->mpris);
+    gboolean media_playing =
+        media != NULL && media->available &&
+        g_strcmp0(media->status, "Playing") == 0;
+    win98_draw_media_icon(cr, icon_x, icon_y, media_playing);
+    bar_add_hit(bar, HIT_MEDIA, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
+    icon_x += 20.0;
+
     if (layout_w > 0) {
         win98_draw_text(cr, icon_x, y + 2.0, layout_w, button_h - 4.0,
                    layout_name, WIN98_ALIGN_CENTER, TRUE, win98_text, FALSE);
@@ -2345,6 +3719,12 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     case HIT_CLIPBOARD:
         open_panel(bar, PANEL_CLIPBOARD);
         break;
+    case HIT_NOTIFICATIONS:
+        open_panel(bar, PANEL_NOTIFICATIONS);
+        break;
+    case HIT_MEDIA:
+        open_panel(bar, PANEL_MEDIA);
+        break;
     default:
         break;
     }
@@ -2365,18 +3745,29 @@ static void bar_right_clicked(GtkGestureClick *gesture, int n_press,
         open_task_menu(bar, hit->value, x);
     } else if (hit->kind == HIT_VOLUME) {
         toggle_volume(bar);
+    } else if (hit->kind == HIT_MEDIA) {
+        mpris_client_play_pause(bar->mpris);
+        mpris_client_poll(bar->mpris);
+        bar_queue_redraw(bar);
     }
 }
 
 static gboolean bar_tick(gpointer user_data) {
     NintyBar *bar = user_data;
+    mpris_client_poll(bar->mpris);
+    update_media_art(bar);
     bar_queue_redraw(bar);
+    if (bar->panel_kind == PANEL_MEDIA) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
     return G_SOURCE_CONTINUE;
 }
 
 static gboolean bar_slow_tick(gpointer user_data) {
     NintyBar *bar = user_data;
     gboolean changed = update_volume(bar);
+    changed |= update_source(bar);
+    changed |= update_audio_devices(bar);
     changed |= update_battery(bar);
     changed |= update_network(bar);
     if (changed) {
@@ -2615,6 +4006,328 @@ static GtkWidget *create_panel_window(NintyBar *bar) {
     return window;
 }
 
+static GdkPaintable *notification_image_paintable(
+    NintyBar *bar, NintyNotification *notification) {
+    if (notification->image != NULL) {
+        return GDK_PAINTABLE(notification->image);
+    }
+
+    const char *name = notification->image_path;
+    if (name == NULL || name[0] == '\0') {
+        name = notification->app_icon;
+    }
+    if (name == NULL || name[0] == '\0') {
+        return NULL;
+    }
+
+    char *key = g_strdup_printf("notification:%s", name);
+    GIcon *icon = NULL;
+    if (g_path_is_absolute(name) ||
+        g_file_test(name, G_FILE_TEST_EXISTS)) {
+        GFile *file = g_file_new_for_path(name);
+        icon = g_file_icon_new(file);
+        g_object_unref(file);
+    } else {
+        icon = g_themed_icon_new_with_default_fallbacks(name);
+    }
+
+    GtkIconPaintable *paintable = lookup_icon(bar, icon, key);
+    g_object_unref(icon);
+    g_free(key);
+    return paintable != NULL ? GDK_PAINTABLE(paintable) : NULL;
+}
+
+static double notification_popup_card_height(
+    NintyNotification *notification) {
+    return notification_has_buttons(notification) ? 92.0 : 68.0;
+}
+
+static void notification_popup_hit_free(NotificationPopupHit *hit) {
+    g_free(hit->action);
+    g_free(hit);
+}
+
+static void notification_popup_hits_clear(NintyBar *bar) {
+    if (bar->popup_hits != NULL) {
+        g_ptr_array_set_size(bar->popup_hits, 0);
+    }
+}
+
+static void notification_popup_add_hit(NintyBar *bar, guint id,
+                                       const char *action, double x,
+                                       double y, double w, double h) {
+    NotificationPopupHit *hit = g_new0(NotificationPopupHit, 1);
+    hit->id = id;
+    hit->action = g_strdup(action);
+    hit->x = x;
+    hit->y = y;
+    hit->w = w;
+    hit->h = h;
+    g_ptr_array_add(bar->popup_hits, hit);
+}
+
+static void notification_popup_draw_card(cairo_t *cr, NintyBar *bar,
+                                         NintyNotification *notification,
+                                         double x, double y, double w,
+                                         double h) {
+    win98_fill(cr, x, y, w, h, win98_face);
+    win98_bevel(cr, x, y, w, h, WIN98_BEVEL_RAISED);
+
+    double tx = x + 2.0;
+    double ty = y + 2.0;
+    double tw = w - 4.0;
+    double th = 16.0;
+    cairo_pattern_t *gradient =
+        cairo_pattern_create_linear(tx, ty, tx, ty + th);
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 0.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_TOP),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_TOP));
+    cairo_pattern_add_color_stop_rgb(
+        gradient, 1.0, NINTYSH_RGB_R(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_G(NINTYSH_COLOR_TITLE_BOTTOM),
+        NINTYSH_RGB_B(NINTYSH_COLOR_TITLE_BOTTOM));
+    cairo_set_source(cr, gradient);
+    cairo_rectangle(cr, tx, ty, tw, th);
+    cairo_fill(cr);
+    cairo_pattern_destroy(gradient);
+
+    const char *app = notification->app_name != NULL &&
+                              notification->app_name[0] != '\0'
+                          ? notification->app_name
+                          : "Notification";
+    win98_draw_text(cr, tx + 4.0, ty, tw - 24.0, th, app,
+                    WIN98_ALIGN_LEFT, TRUE, win98_white, TRUE);
+
+    double close_x = x + w - 18.0;
+    double close_y = y + 3.0;
+    win98_fill(cr, close_x, close_y, 14.0, 14.0, win98_face);
+    win98_bevel(cr, close_x, close_y, 14.0, 14.0, WIN98_BEVEL_RAISED);
+    cairo_set_source_rgb(cr, 0, 0, 0);
+    cairo_set_line_width(cr, 1.0);
+    cairo_move_to(cr, close_x + 4.5, close_y + 4.5);
+    cairo_line_to(cr, close_x + 9.5, close_y + 9.5);
+    cairo_move_to(cr, close_x + 9.5, close_y + 4.5);
+    cairo_line_to(cr, close_x + 4.5, close_y + 9.5);
+    cairo_stroke(cr);
+    notification_popup_add_hit(bar, notification->id, NULL, close_x - 2.0,
+                               close_y - 2.0, 18.0, 18.0);
+
+    double content_y = y + 20.0;
+    double action_h = notification_has_buttons(notification) ? 24.0 : 0.0;
+    double content_h = h - 20.0 - action_h - 4.0;
+    const char *default_action =
+        notification_default_action(notification);
+    if (default_action != NULL) {
+        notification_popup_add_hit(bar, notification->id, default_action,
+                                   x + 2.0, content_y, w - 4.0,
+                                   content_h);
+    }
+
+    GdkPaintable *image = notification_image_paintable(bar, notification);
+    double text_x = x + 10.0;
+    if (image != NULL) {
+        draw_gdk_paintable(cr, image, x + 8.0, content_y + 2.0, 36.0);
+        text_x = x + 52.0;
+    } else {
+        win98_draw_notification_icon(cr, x + 8.0, content_y + 4.0,
+                                     FALSE);
+        text_x = x + 32.0;
+    }
+
+    double text_w = x + w - 8.0 - text_x;
+    win98_draw_text(cr, text_x, content_y, text_w, 18.0,
+                    notification->summary, WIN98_ALIGN_LEFT, TRUE,
+                    win98_text, TRUE);
+    win98_draw_text(cr, text_x, content_y + 18.0, text_w, 16.0,
+                    notification->body, WIN98_ALIGN_LEFT, FALSE,
+                    win98_text_disabled, TRUE);
+
+    if (action_h > 0.0) {
+        double button_y = y + h - 22.0;
+        double button_x = x + 8.0;
+        for (int i = 0; notification->actions[i] != NULL; i += 2) {
+            const char *label = notification->actions[i + 1];
+            if (label == NULL || label[0] == '\0') {
+                continue;
+            }
+            double button_w = win98_text_width(label, FALSE) + 18.0;
+            button_w = MAX(button_w, 48.0);
+            if (button_x + button_w > x + w - 8.0) {
+                break;
+            }
+            win98_fill(cr, button_x, button_y, button_w, 18.0,
+                       win98_face);
+            win98_bevel(cr, button_x, button_y, button_w, 18.0,
+                        WIN98_BEVEL_RAISED);
+            win98_draw_text(cr, button_x, button_y, button_w, 18.0, label,
+                            WIN98_ALIGN_CENTER, FALSE, win98_text, TRUE);
+            notification_popup_add_hit(bar, notification->id,
+                                       notification->actions[i], button_x,
+                                       button_y, button_w, 18.0);
+            button_x += button_w + 4.0;
+        }
+    }
+}
+
+static void notification_popup_draw(GtkDrawingArea *area, cairo_t *cr,
+                                    int width, int height,
+                                    gpointer user_data) {
+    (void)area;
+    NintyBar *bar = user_data;
+
+    cairo_save(cr);
+    cairo_set_operator(cr, CAIRO_OPERATOR_SOURCE);
+    cairo_set_source_rgba(cr, 0, 0, 0, 0);
+    cairo_paint(cr);
+    cairo_restore(cr);
+
+    notification_popup_hits_clear(bar);
+    if (width < 64 || height < 32) {
+        return;
+    }
+
+    cairo_set_antialias(cr, CAIRO_ANTIALIAS_NONE);
+    double x = 4.0;
+    double y = 4.0;
+    double w = width - 8.0;
+    int shown = 0;
+
+    for (guint i = 0; i < bar->notifications->len; i++) {
+        NintyNotification *notification =
+            g_ptr_array_index(bar->notifications, i);
+        if (!notification->active) {
+            continue;
+        }
+        if (shown >= NINTYSH_NOTIFICATION_POPUP_MAX) {
+            break;
+        }
+        double card_h = notification_popup_card_height(notification);
+        notification_popup_draw_card(cr, bar, notification, x, y, w,
+                                     card_h);
+        y += card_h + 6.0;
+        shown++;
+    }
+}
+
+static void notification_popup_clicked(GtkGestureClick *gesture,
+                                       int n_press, double x, double y,
+                                       gpointer user_data) {
+    (void)gesture;
+    (void)n_press;
+    NintyBar *bar = user_data;
+
+    for (guint i = bar->popup_hits->len; i > 0; i--) {
+        NotificationPopupHit *hit =
+            g_ptr_array_index(bar->popup_hits, i - 1);
+        if (!rect_contains(x, y, hit->x, hit->y, hit->w, hit->h)) {
+            continue;
+        }
+        int index = notification_index_for_id(bar, hit->id);
+        if (index < 0) {
+            return;
+        }
+        if (hit->action != NULL) {
+            notification_emit_action(bar, hit->id, hit->action);
+        }
+        notification_remove_at(bar, (guint)index, 2);
+        return;
+    }
+}
+
+static GtkWidget *create_notification_popup(NintyBar *bar, int width,
+                                            int height) {
+    GtkWidget *window = gtk_application_window_new(bar->app);
+    gtk_widget_add_css_class(window, "nintysh");
+    gtk_window_set_title(GTK_WINDOW(window), "nintysh-notification");
+    gtk_window_set_decorated(GTK_WINDOW(window), FALSE);
+    gtk_window_set_resizable(GTK_WINDOW(window), FALSE);
+    gtk_window_set_default_size(GTK_WINDOW(window), width, height);
+
+    GdkRectangle geometry = { 0 };
+    primary_monitor_geometry(&geometry);
+
+    gtk_layer_init_for_window(GTK_WINDOW(window));
+    gtk_layer_set_namespace(GTK_WINDOW(window), "nintysh-notification");
+    gtk_layer_set_layer(GTK_WINDOW(window), GTK_LAYER_SHELL_LAYER_OVERLAY);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                         TRUE);
+    gtk_layer_set_anchor(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
+                         TRUE);
+    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_BOTTOM,
+                         NINTYSH_OSD_MARGIN_BOTTOM);
+    gtk_layer_set_margin(GTK_WINDOW(window), GTK_LAYER_SHELL_EDGE_RIGHT,
+                         NINTYSH_NOTIFICATION_POPUP_MARGIN);
+    gtk_layer_set_exclusive_zone(GTK_WINDOW(window), -1);
+    gtk_layer_set_keyboard_mode(GTK_WINDOW(window),
+                                GTK_LAYER_SHELL_KEYBOARD_MODE_NONE);
+
+    bar->popup_area = gtk_drawing_area_new();
+    gtk_drawing_area_set_draw_func(GTK_DRAWING_AREA(bar->popup_area),
+                                   notification_popup_draw, bar, NULL);
+    gtk_window_set_child(GTK_WINDOW(window), bar->popup_area);
+
+    GtkGesture *click = gtk_gesture_click_new();
+    gtk_gesture_single_set_button(GTK_GESTURE_SINGLE(click), 1);
+    g_signal_connect(click, "pressed",
+                     G_CALLBACK(notification_popup_clicked), bar);
+    gtk_widget_add_controller(bar->popup_area,
+                              GTK_EVENT_CONTROLLER(click));
+
+    gtk_widget_set_visible(window, FALSE);
+    return window;
+}
+
+static void notification_popup_destroy(NintyBar *bar) {
+    if (bar->popup_window != NULL) {
+        gtk_window_destroy(GTK_WINDOW(bar->popup_window));
+        bar->popup_window = NULL;
+        bar->popup_area = NULL;
+    }
+    notification_popup_hits_clear(bar);
+}
+
+static gboolean notification_popup_update_cb(gpointer user_data) {
+    NintyBar *bar = user_data;
+    bar->popup_update_source = 0;
+    notification_popup_destroy(bar);
+
+    int shown = 0;
+    int height = 8;
+    for (guint i = 0; i < bar->notifications->len; i++) {
+        NintyNotification *notification =
+            g_ptr_array_index(bar->notifications, i);
+        if (!notification->active) {
+            continue;
+        }
+        if (shown >= NINTYSH_NOTIFICATION_POPUP_MAX) {
+            break;
+        }
+        if (shown > 0) {
+            height += 6;
+        }
+        height += (int)notification_popup_card_height(notification);
+        shown++;
+    }
+    if (shown == 0) {
+        return G_SOURCE_REMOVE;
+    }
+
+    bar->popup_window = create_notification_popup(
+        bar, NINTYSH_NOTIFICATION_POPUP_WIDTH, height);
+    gtk_widget_set_visible(bar->popup_window, TRUE);
+    gtk_window_present(GTK_WINDOW(bar->popup_window));
+    gtk_widget_queue_draw(bar->popup_area);
+    return G_SOURCE_REMOVE;
+}
+
+static void notification_popup_update(NintyBar *bar) {
+    if (bar->popup_update_source == 0) {
+        bar->popup_update_source =
+            g_idle_add(notification_popup_update_cb, bar);
+    }
+}
+
 static GtkWidget *create_osd_window(NintyBar *bar) {
     GtkWidget *window = gtk_application_window_new(bar->app);
     gtk_widget_add_css_class(window, "nintysh");
@@ -2650,55 +4363,616 @@ static GtkWidget *create_osd_window(NintyBar *bar) {
     return window;
 }
 
+static PanelKind panel_kind_from_name(const char *name) {
+    if (name == NULL) {
+        return PANEL_NONE;
+    }
+    if (g_strcmp0(name, "audio") == 0 ||
+        g_strcmp0(name, "volume") == 0 ||
+        g_strcmp0(name, "control-center") == 0 ||
+        g_strcmp0(name, "controlcenter") == 0 ||
+        g_strcmp0(name, "settings") == 0 ||
+        g_strcmp0(name, "sound") == 0) {
+        return PANEL_VOLUME;
+    }
+    if (g_strcmp0(name, "calendar") == 0 ||
+        g_strcmp0(name, "clock") == 0 ||
+        g_strcmp0(name, "date") == 0) {
+        return PANEL_CALENDAR;
+    }
+    if (g_strcmp0(name, "network") == 0 ||
+        g_strcmp0(name, "wifi") == 0) {
+        return PANEL_NETWORK;
+    }
+    if (g_strcmp0(name, "power") == 0 ||
+        g_strcmp0(name, "battery") == 0) {
+        return PANEL_POWER;
+    }
+    if (g_strcmp0(name, "clipboard") == 0) {
+        return PANEL_CLIPBOARD;
+    }
+    if (g_strcmp0(name, "notifications") == 0 ||
+        g_strcmp0(name, "notification") == 0) {
+        return PANEL_NOTIFICATIONS;
+    }
+    if (g_strcmp0(name, "media") == 0 ||
+        g_strcmp0(name, "player") == 0 ||
+        g_strcmp0(name, "mpris") == 0) {
+        return PANEL_MEDIA;
+    }
+    return PANEL_NONE;
+}
+
+static void toggle_named_panel(NintyBar *bar, const char *name) {
+    if (g_strcmp0(name, "launcher") == 0 ||
+        g_strcmp0(name, "start") == 0) {
+        if (bar->menu_open) {
+            close_menu(bar);
+        } else {
+            open_menu(bar);
+        }
+        return;
+    }
+
+    PanelKind kind = panel_kind_from_name(name);
+    if (kind == PANEL_NONE) {
+        return;
+    }
+    if (bar->panel_kind == kind) {
+        close_panel(bar);
+    } else {
+        open_panel(bar, kind);
+    }
+}
+
+static void open_named_panel(NintyBar *bar, const char *name) {
+    if (g_strcmp0(name, "launcher") == 0 ||
+        g_strcmp0(name, "start") == 0) {
+        open_menu(bar);
+        return;
+    }
+    PanelKind kind = panel_kind_from_name(name);
+    if (kind != PANEL_NONE) {
+        open_panel(bar, kind);
+    }
+}
+
+static char *join_command_args(gchar **parts, int start, int count) {
+    if (start >= count) {
+        return g_strdup("");
+    }
+    GString *text = g_string_new(parts[start]);
+    for (int i = start + 1; i < count; i++) {
+        g_string_append_c(text, ' ');
+        g_string_append(text, parts[i]);
+    }
+    return g_string_free(text, FALSE);
+}
+
+static int audio_default_index(GPtrArray *devices) {
+    for (guint i = 0; i < devices->len; i++) {
+        AudioDevice *device = g_ptr_array_index(devices, i);
+        if (device->is_default) {
+            return (int)i;
+        }
+    }
+    return -1;
+}
+
+static AudioDevice *audio_find_device(GPtrArray *devices,
+                                      const char *query) {
+    if (query == NULL || query[0] == '\0') {
+        return NULL;
+    }
+
+    char *end = NULL;
+    long id = strtol(query, &end, 10);
+    if (end != query && *end == '\0') {
+        for (guint i = 0; i < devices->len; i++) {
+            AudioDevice *device = g_ptr_array_index(devices, i);
+            if (device->id == id) {
+                return device;
+            }
+        }
+    }
+
+    char *needle = g_utf8_casefold(query, -1);
+    AudioDevice *partial = NULL;
+    for (guint i = 0; i < devices->len; i++) {
+        AudioDevice *device = g_ptr_array_index(devices, i);
+        char *folded = g_utf8_casefold(device->label, -1);
+        gboolean exact = g_strcmp0(folded, needle) == 0;
+        gboolean contains = strstr(folded, needle) != NULL;
+        g_free(folded);
+        if (exact) {
+            g_free(needle);
+            return device;
+        }
+        if (contains && partial == NULL) {
+            partial = device;
+        }
+    }
+    g_free(needle);
+    return partial;
+}
+
+static gboolean audio_set_default_query(NintyBar *bar, GPtrArray *devices,
+                                        const char *query,
+                                        gboolean source) {
+    if (query == NULL || query[0] == '\0' || devices->len == 0) {
+        return FALSE;
+    }
+
+    AudioDevice *device = NULL;
+    if (g_strcmp0(query, "next") == 0 ||
+        g_strcmp0(query, "prev") == 0 ||
+        g_strcmp0(query, "previous") == 0) {
+        int index = audio_default_index(devices);
+        if (g_strcmp0(query, "next") == 0) {
+            index = index < 0 ? 0 : (index + 1) % (int)devices->len;
+        } else {
+            index = index <= 0 ? (int)devices->len - 1 : index - 1;
+        }
+        device = g_ptr_array_index(devices, (guint)index);
+    } else {
+        device = audio_find_device(devices, query);
+    }
+
+    if (device == NULL) {
+        osd_show_text(bar, source ? "Input device not found"
+                                  : "Output device not found");
+        return FALSE;
+    }
+    set_default_audio_device(bar, device->id, source);
+    return TRUE;
+}
+
+static void command_panel(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    const char *name = count > 2 ? parts[2] : NULL;
+
+    if (action == NULL) {
+        return;
+    }
+    if (g_strcmp0(action, "close") == 0) {
+        if (name != NULL &&
+            (g_strcmp0(name, "launcher") == 0 ||
+             g_strcmp0(name, "start") == 0)) {
+            close_menu(bar);
+            return;
+        }
+        if (name != NULL) {
+            PanelKind kind = panel_kind_from_name(name);
+            if (kind != PANEL_NONE && bar->panel_kind == kind) {
+                close_panel(bar);
+                return;
+            }
+        }
+        close_menu(bar);
+        close_panel(bar);
+        return;
+    }
+    if (g_strcmp0(action, "open") == 0) {
+        if (name != NULL) {
+            open_named_panel(bar, name);
+        }
+        return;
+    }
+    if (g_strcmp0(action, "toggle") == 0) {
+        if (name != NULL) {
+            toggle_named_panel(bar, name);
+        }
+        return;
+    }
+    open_named_panel(bar, action);
+}
+
+static void command_launcher(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    if (action == NULL || g_strcmp0(action, "open") == 0) {
+        open_menu(bar);
+    } else if (g_strcmp0(action, "close") == 0) {
+        close_menu(bar);
+    } else if (g_strcmp0(action, "toggle") == 0) {
+        if (bar->menu_open) {
+            close_menu(bar);
+        } else {
+            open_menu(bar);
+        }
+    }
+}
+
+static void command_notifications(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    if (action == NULL || g_strcmp0(action, "open") == 0 ||
+        g_strcmp0(action, "list") == 0) {
+        open_panel(bar, PANEL_NOTIFICATIONS);
+        return;
+    }
+    if (g_strcmp0(action, "toggle") == 0) {
+        toggle_named_panel(bar, "notifications");
+        return;
+    }
+    if (g_strcmp0(action, "clear") == 0) {
+        notifications_clear(bar);
+        return;
+    }
+    if (g_strcmp0(action, "dismiss") == 0 ||
+        g_strcmp0(action, "close") == 0 ||
+        g_strcmp0(action, "remove") == 0) {
+        if (count > 2 && g_strcmp0(parts[2], "all") == 0) {
+            while (bar->notifications->len > 0) {
+                notification_remove_at(bar,
+                                       bar->notifications->len - 1, 2);
+            }
+            return;
+        }
+        if (count > 2) {
+            guint id = (guint)g_ascii_strtoull(parts[2], NULL, 10);
+            int index = notification_index_for_id(bar, id);
+            if (index >= 0) {
+                notification_remove_at(bar, (guint)index, 2);
+            }
+            return;
+        }
+    }
+    open_panel(bar, PANEL_NOTIFICATIONS);
+}
+
+static void command_audio(NintyBar *bar, gchar **parts, int count) {
+    const char *scope = count > 1 ? parts[1] : NULL;
+    if (scope == NULL || g_strcmp0(scope, "open") == 0 ||
+        g_strcmp0(scope, "panel") == 0 ||
+        g_strcmp0(scope, "show") == 0) {
+        open_panel(bar, PANEL_VOLUME);
+        return;
+    }
+
+    gboolean source = FALSE;
+    int action_index = 1;
+    if (g_strcmp0(scope, "output") == 0 ||
+        g_strcmp0(scope, "out") == 0 ||
+        g_strcmp0(scope, "sink") == 0 ||
+        g_strcmp0(scope, "speaker") == 0) {
+        action_index = 2;
+    } else if (g_strcmp0(scope, "input") == 0 ||
+               g_strcmp0(scope, "in") == 0 ||
+               g_strcmp0(scope, "mic") == 0 ||
+               g_strcmp0(scope, "microphone") == 0 ||
+               g_strcmp0(scope, "source") == 0) {
+        source = TRUE;
+        action_index = 2;
+    }
+
+    const char *action =
+        count > action_index ? parts[action_index] : NULL;
+    if (action == NULL) {
+        open_panel(bar, PANEL_VOLUME);
+        return;
+    }
+    if (g_strcmp0(action, "volume") == 0) {
+        action_index++;
+        action = count > action_index ? parts[action_index] : NULL;
+        if (action == NULL) {
+            open_panel(bar, PANEL_VOLUME);
+            return;
+        }
+    }
+    if (g_strcmp0(action, "list") == 0 ||
+        g_strcmp0(action, "devices") == 0) {
+        open_panel(bar, PANEL_VOLUME);
+        return;
+    }
+    if (g_strcmp0(action, "up") == 0) {
+        if (source) {
+            apply_source_volume(
+                bar, bar->source_percent + NINTYSH_AUDIO_STEP, TRUE);
+        } else {
+            apply_volume(bar, bar->volume_percent + NINTYSH_AUDIO_STEP,
+                         TRUE);
+        }
+        return;
+    }
+    if (g_strcmp0(action, "down") == 0) {
+        if (source) {
+            apply_source_volume(
+                bar, bar->source_percent - NINTYSH_AUDIO_STEP, TRUE);
+        } else {
+            apply_volume(bar, bar->volume_percent - NINTYSH_AUDIO_STEP,
+                         TRUE);
+        }
+        return;
+    }
+    if (g_strcmp0(action, "mute") == 0 ||
+        g_strcmp0(action, "toggle") == 0) {
+        if (source) {
+            toggle_source(bar);
+        } else {
+            toggle_volume(bar);
+        }
+        return;
+    }
+    if (g_strcmp0(action, "set") == 0 ||
+        g_strcmp0(action, "to") == 0) {
+        const char *value =
+            count > action_index + 1 ? parts[action_index + 1] : NULL;
+        if (value != NULL) {
+            if (source) {
+                apply_source_volume(bar, atoi(value), TRUE);
+            } else {
+                apply_volume(bar, atoi(value), TRUE);
+            }
+        }
+        return;
+    }
+    if (g_strcmp0(action, "next") == 0 ||
+        g_strcmp0(action, "prev") == 0 ||
+        g_strcmp0(action, "previous") == 0) {
+        audio_set_default_query(bar,
+                                source ? bar->audio_sources
+                                       : bar->audio_sinks,
+                                action, source);
+        return;
+    }
+    if (g_strcmp0(action, "default") == 0 ||
+        g_strcmp0(action, "use") == 0 ||
+        g_strcmp0(action, "select") == 0 ||
+        g_strcmp0(action, "device") == 0) {
+        char *query = join_command_args(parts, action_index + 1, count);
+        if (query[0] == '\0') {
+            g_free(query);
+            open_panel(bar, PANEL_VOLUME);
+            return;
+        }
+        audio_set_default_query(bar,
+                                source ? bar->audio_sources
+                                       : bar->audio_sinks,
+                                query, source);
+        g_free(query);
+        return;
+    }
+
+    char *end = NULL;
+    long value = strtol(action, &end, 10);
+    if (end != action && *end == '\0') {
+        if (source) {
+            apply_source_volume(bar, (int)value, TRUE);
+        } else {
+            apply_volume(bar, (int)value, TRUE);
+        }
+        return;
+    }
+    open_panel(bar, PANEL_VOLUME);
+}
+
+static void command_media(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    gboolean acted = FALSE;
+
+    if (action == NULL || g_strcmp0(action, "open") == 0 ||
+        g_strcmp0(action, "panel") == 0 ||
+        g_strcmp0(action, "list") == 0) {
+        open_panel(bar, PANEL_MEDIA);
+        return;
+    }
+    if (g_strcmp0(action, "toggle-panel") == 0) {
+        toggle_named_panel(bar, "media");
+        return;
+    }
+    if (g_strcmp0(action, "play-pause") == 0 ||
+        g_strcmp0(action, "toggle") == 0 ||
+        g_strcmp0(action, "toggle-play") == 0) {
+        mpris_client_play_pause(bar->mpris);
+        acted = TRUE;
+    } else if (g_strcmp0(action, "play") == 0) {
+        mpris_client_play(bar->mpris);
+        acted = TRUE;
+    } else if (g_strcmp0(action, "pause") == 0) {
+        mpris_client_pause(bar->mpris);
+        acted = TRUE;
+    } else if (g_strcmp0(action, "next") == 0) {
+        mpris_client_next(bar->mpris);
+        acted = TRUE;
+    } else if (g_strcmp0(action, "previous") == 0 ||
+               g_strcmp0(action, "prev") == 0) {
+        mpris_client_previous(bar->mpris);
+        acted = TRUE;
+    } else if (g_strcmp0(action, "seek") == 0 && count > 2) {
+        double seconds = g_ascii_strtod(parts[2], NULL);
+        mpris_client_seek(bar->mpris,
+                          (gint64)(seconds * 1000000.0));
+        acted = TRUE;
+    } else if (g_strcmp0(action, "position") == 0 && count > 2) {
+        double seconds = g_ascii_strtod(parts[2], NULL);
+        mpris_client_set_position(bar->mpris,
+                                  (gint64)(seconds * 1000000.0));
+        acted = TRUE;
+    }
+
+    if (!acted) {
+        open_panel(bar, PANEL_MEDIA);
+        return;
+    }
+    mpris_client_poll(bar->mpris);
+    update_media_art(bar);
+    bar_queue_redraw(bar);
+    if (bar->panel_kind == PANEL_MEDIA) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+}
+
 void ninty_bar_command(NintyBar *bar, const char *command) {
     gchar **parts = g_strsplit(command, " ", 0);
     int count = g_strv_length(parts);
 
-    if (count == 0) {
+    if (count == 0 || parts[0][0] == '\0') {
         g_strfreev(parts);
         return;
     }
 
-    if (g_strcmp0(parts[0], "launcher") == 0 ||
-        g_strcmp0(parts[0], "start") == 0) {
-        open_menu(bar);
-    } else if (g_strcmp0(parts[0], "close") == 0) {
-        close_menu(bar);
-        close_panel(bar);
-    } else if (g_strcmp0(parts[0], "calendar") == 0 ||
-               g_strcmp0(parts[0], "clock") == 0) {
-        open_panel(bar, PANEL_CALENDAR);
-    } else if (g_strcmp0(parts[0], "network") == 0) {
-        open_panel(bar, PANEL_NETWORK);
-    } else if (g_strcmp0(parts[0], "clipboard") == 0) {
-        open_panel(bar, PANEL_CLIPBOARD);
-    } else if (g_strcmp0(parts[0], "power") == 0) {
-        open_panel(bar, PANEL_POWER);
-    } else if (g_strcmp0(parts[0], "layout") == 0) {
-        niri_client_next_layout(bar->niri);
-    } else if (g_strcmp0(parts[0], "workspace") == 0 && count > 1) {
-        niri_client_focus_workspace(bar->niri,
-                                    g_ascii_strtoll(parts[1], NULL, 10));
-    } else if (g_strcmp0(parts[0], "volume") == 0) {
-        if (count == 1) {
-            open_panel(bar, PANEL_VOLUME);
-        } else if (g_strcmp0(parts[1], "up") == 0) {
-            apply_volume(bar, bar->volume_percent + 5, TRUE);
-        } else if (g_strcmp0(parts[1], "down") == 0) {
-            apply_volume(bar, bar->volume_percent - 5, TRUE);
-        } else if (g_strcmp0(parts[1], "mute") == 0) {
-            toggle_volume(bar);
-        } else {
-            apply_volume(bar, atoi(parts[1]), TRUE);
+    char *verb = g_ascii_strdown(parts[0], -1);
+    for (char *p = verb; *p != '\0'; p++) {
+        if (*p == '_') {
+            *p = '-';
         }
-    } else if (g_strcmp0(parts[0], "osd") == 0) {
-        const char *text = strchr(command, ' ');
-        osd_show_text(bar, text != NULL ? text + 1 : "");
-    } else if (g_strcmp0(parts[0], "run") == 0) {
+    }
+    const char *arg = count > 1 ? parts[1] : NULL;
+
+    if (g_strcmp0(verb, "panel") == 0) {
+        command_panel(bar, parts, count);
+    } else if (g_strcmp0(verb, "audio") == 0 ||
+               g_strcmp0(verb, "sound") == 0) {
+        command_audio(bar, parts, count);
+    } else if (g_strcmp0(verb, "notifications") == 0 ||
+               g_strcmp0(verb, "notification") == 0 ||
+               g_strcmp0(verb, "notify") == 0) {
+        command_notifications(bar, parts, count);
+    } else if (g_strcmp0(verb, "media") == 0 ||
+               g_strcmp0(verb, "player") == 0 ||
+               g_strcmp0(verb, "mpris") == 0) {
+        command_media(bar, parts, count);
+    } else if (g_strcmp0(verb, "launcher") == 0 ||
+               g_strcmp0(verb, "start") == 0) {
+        command_launcher(bar, parts, count);
+    } else if (g_strcmp0(verb, "session") == 0) {
+        if (arg == NULL || g_strcmp0(arg, "lock") == 0) {
+            run_shell_command(NINTYSH_LOCK_COMMAND);
+        }
+    } else if (g_strcmp0(verb, "brightness") == 0) {
+        if (arg == NULL || g_strcmp0(arg, "up") == 0) {
+            run_shell_command(NINTYSH_BRIGHTNESS_UP_COMMAND);
+        } else if (g_strcmp0(arg, "down") == 0) {
+            run_shell_command(NINTYSH_BRIGHTNESS_DOWN_COMMAND);
+        }
+    } else if (g_strcmp0(verb, "screenshot") == 0) {
+        if (arg == NULL || g_strcmp0(arg, "region") == 0) {
+            run_shell_command(NINTYSH_SCREENSHOT_REGION_COMMAND);
+        } else if (g_strcmp0(arg, "fullscreen") == 0 ||
+                   g_strcmp0(arg, "full") == 0) {
+            run_shell_command(NINTYSH_SCREENSHOT_FULLSCREEN_COMMAND);
+        }
+    } else if (g_strcmp0(verb, "workspace") == 0) {
+        const char *target = arg;
+        if (g_strcmp0(arg, "focus") == 0 && count > 2) {
+            target = parts[2];
+        }
+        if (target != NULL) {
+            niri_client_focus_workspace(
+                bar->niri, g_ascii_strtoll(target, NULL, 10));
+        }
+    } else if (g_strcmp0(verb, "layout") == 0) {
+        niri_client_next_layout(bar->niri);
+    } else if (g_strcmp0(verb, "osd") == 0) {
+        if (g_strcmp0(arg, "show") == 0) {
+            char *text = join_command_args(parts, 2, count);
+            osd_show_text(bar, text);
+            g_free(text);
+        } else {
+            const char *text = strchr(command, ' ');
+            osd_show_text(bar, text != NULL ? text + 1 : "");
+        }
+    } else if (g_strcmp0(verb, "run") == 0) {
         const char *text = strchr(command, ' ');
         run_shell_command(text != NULL ? text + 1 : "");
+    } else if (g_strcmp0(verb, "panel-toggle") == 0 ||
+               g_strcmp0(verb, "toggle-panel") == 0) {
+        if (arg != NULL) {
+            toggle_named_panel(bar, arg);
+        }
+    } else if (g_strcmp0(verb, "panel-open") == 0 ||
+               g_strcmp0(verb, "panel-show") == 0 ||
+               g_strcmp0(verb, "open-panel") == 0) {
+        if (arg != NULL) {
+            open_named_panel(bar, arg);
+        }
+    } else if (g_strcmp0(verb, "panel-close") == 0 ||
+               g_strcmp0(verb, "panel-hide") == 0 ||
+               g_strcmp0(verb, "close") == 0) {
+        close_menu(bar);
+        close_panel(bar);
+    } else if (g_strcmp0(verb, "calendar") == 0 ||
+               g_strcmp0(verb, "clock") == 0) {
+        open_panel(bar, PANEL_CALENDAR);
+    } else if (g_strcmp0(verb, "network") == 0) {
+        open_panel(bar, PANEL_NETWORK);
+    } else if (g_strcmp0(verb, "clipboard") == 0) {
+        open_panel(bar, PANEL_CLIPBOARD);
+    } else if (g_strcmp0(verb, "notifications-toggle") == 0 ||
+               g_strcmp0(verb, "notification-toggle") == 0) {
+        toggle_named_panel(bar, "notifications");
+    } else if (g_strcmp0(verb, "notifications-clear") == 0 ||
+               g_strcmp0(verb, "notification-clear") == 0 ||
+               g_strcmp0(verb, "clear-notifications") == 0) {
+        notifications_clear(bar);
+    } else if (g_strcmp0(verb, "power") == 0) {
+        open_panel(bar, PANEL_POWER);
+    } else if (g_strcmp0(verb, "control-center") == 0 ||
+               g_strcmp0(verb, "settings-toggle") == 0 ||
+               g_strcmp0(verb, "settings") == 0) {
+        toggle_named_panel(bar, "audio");
+    } else if (g_strcmp0(verb, "volume") == 0) {
+        if (count == 1) {
+            open_panel(bar, PANEL_VOLUME);
+        } else if (g_strcmp0(arg, "up") == 0) {
+            apply_volume(bar, bar->volume_percent + NINTYSH_AUDIO_STEP,
+                         TRUE);
+        } else if (g_strcmp0(arg, "down") == 0) {
+            apply_volume(bar, bar->volume_percent - NINTYSH_AUDIO_STEP,
+                         TRUE);
+        } else if (g_strcmp0(arg, "mute") == 0 ||
+                   g_strcmp0(arg, "toggle") == 0) {
+            toggle_volume(bar);
+        } else {
+            apply_volume(bar, atoi(arg), TRUE);
+        }
+    } else if (g_strcmp0(verb, "volume-up") == 0) {
+        apply_volume(bar, bar->volume_percent + NINTYSH_AUDIO_STEP, TRUE);
+    } else if (g_strcmp0(verb, "volume-down") == 0) {
+        apply_volume(bar, bar->volume_percent - NINTYSH_AUDIO_STEP, TRUE);
+    } else if (g_strcmp0(verb, "volume-mute") == 0 ||
+               g_strcmp0(verb, "volume-toggle") == 0) {
+        toggle_volume(bar);
+    } else if (g_strcmp0(verb, "microphone") == 0 ||
+               g_strcmp0(verb, "mic") == 0) {
+        if (count == 1) {
+            open_panel(bar, PANEL_VOLUME);
+        } else if (g_strcmp0(arg, "up") == 0) {
+            apply_source_volume(
+                bar, bar->source_percent + NINTYSH_AUDIO_STEP, TRUE);
+        } else if (g_strcmp0(arg, "down") == 0) {
+            apply_source_volume(
+                bar, bar->source_percent - NINTYSH_AUDIO_STEP, TRUE);
+        } else if (g_strcmp0(arg, "mute") == 0 ||
+                   g_strcmp0(arg, "toggle") == 0) {
+            toggle_source(bar);
+        } else {
+            apply_source_volume(bar, atoi(arg), TRUE);
+        }
+    } else if (g_strcmp0(verb, "microphone-up") == 0 ||
+               g_strcmp0(verb, "mic-up") == 0) {
+        apply_source_volume(bar, bar->source_percent + NINTYSH_AUDIO_STEP,
+                            TRUE);
+    } else if (g_strcmp0(verb, "microphone-down") == 0 ||
+               g_strcmp0(verb, "mic-down") == 0) {
+        apply_source_volume(bar, bar->source_percent - NINTYSH_AUDIO_STEP,
+                            TRUE);
+    } else if (g_strcmp0(verb, "microphone-mute") == 0 ||
+               g_strcmp0(verb, "mic-mute") == 0) {
+        toggle_source(bar);
+    } else if (g_strcmp0(verb, "session-lock") == 0 ||
+               g_strcmp0(verb, "lock") == 0) {
+        run_shell_command(NINTYSH_LOCK_COMMAND);
+    } else if (g_strcmp0(verb, "brightness-up") == 0) {
+        run_shell_command(NINTYSH_BRIGHTNESS_UP_COMMAND);
+    } else if (g_strcmp0(verb, "brightness-down") == 0) {
+        run_shell_command(NINTYSH_BRIGHTNESS_DOWN_COMMAND);
+    } else if (g_strcmp0(verb, "screenshot-region") == 0) {
+        run_shell_command(NINTYSH_SCREENSHOT_REGION_COMMAND);
+    } else if (g_strcmp0(verb, "screenshot-fullscreen") == 0) {
+        run_shell_command(NINTYSH_SCREENSHOT_FULLSCREEN_COMMAND);
     }
 
+    g_free(verb);
     g_strfreev(parts);
 }
 
@@ -2714,6 +4988,14 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->menu_query = g_strdup("");
     bar->clipboard_history =
         g_ptr_array_new_with_free_func((GDestroyNotify)g_free);
+    bar->audio_sinks =
+        g_ptr_array_new_with_free_func((GDestroyNotify)audio_device_free);
+    bar->audio_sources =
+        g_ptr_array_new_with_free_func((GDestroyNotify)audio_device_free);
+    bar->notifications = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)notification_free);
+    bar->popup_hits = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)notification_popup_hit_free);
     bar->surfaces = g_ptr_array_new_with_free_func(
         (GDestroyNotify)bar_surface_free);
     bar->icon_cache = g_hash_table_new_full(
@@ -2755,10 +5037,16 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     g_date_time_unref(now);
 
     bar->niri = niri_client_new(niri_changed_cb, bar);
+    bar->mpris = mpris_client_new(NULL, bar);
+    mpris_client_poll(bar->mpris);
+    update_media_art(bar);
 
     update_volume(bar);
+    update_source(bar);
+    update_audio_devices(bar);
     update_battery(bar);
     update_network(bar);
+    notifications_init(bar);
 
     GNetworkMonitor *monitor = g_network_monitor_get_default();
     bar->network_handler = g_signal_connect(
@@ -2790,6 +5078,11 @@ void ninty_bar_free(NintyBar *bar) {
     if (bar->osd_source != 0) {
         g_source_remove(bar->osd_source);
     }
+    if (bar->popup_update_source != 0) {
+        g_source_remove(bar->popup_update_source);
+        bar->popup_update_source = 0;
+    }
+    notification_popup_destroy(bar);
     if (bar->network_handler != 0) {
         g_signal_handler_disconnect(g_network_monitor_get_default(),
                                     bar->network_handler);
@@ -2800,11 +5093,23 @@ void ninty_bar_free(NintyBar *bar) {
     if (bar->niri != NULL) {
         niri_client_free(bar->niri);
     }
+    if (bar->mpris != NULL) {
+        mpris_client_free(bar->mpris);
+    }
+    if (bar->media_art != NULL) {
+        g_object_unref(bar->media_art);
+    }
+    g_free(bar->media_art_source);
 
+    notifications_free(bar);
     g_hash_table_destroy(bar->app_index);
     g_ptr_array_unref(bar->apps);
     g_ptr_array_unref(bar->menu_results);
     g_ptr_array_unref(bar->clipboard_history);
+    g_ptr_array_unref(bar->audio_sinks);
+    g_ptr_array_unref(bar->audio_sources);
+    g_ptr_array_unref(bar->notifications);
+    g_ptr_array_unref(bar->popup_hits);
     g_free(bar->last_clipboard);
     g_free(bar->menu_query);
     g_ptr_array_unref(bar->surfaces);
