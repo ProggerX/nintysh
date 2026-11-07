@@ -606,8 +606,10 @@ static char *window_label(NiriWindow *window) {
 static gboolean run_command_sync(const char *command, char **output) {
     gint status = 0;
     GError *error = NULL;
-    gboolean spawned = g_spawn_command_line_sync(command, output, NULL,
+    gchar *errors = NULL;
+    gboolean spawned = g_spawn_command_line_sync(command, output, &errors,
                                                  &status, &error);
+    g_free(errors);
     if (!spawned) {
         g_clear_error(&error);
         return FALSE;
