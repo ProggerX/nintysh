@@ -6,6 +6,7 @@
 #include "gamma.h"
 #include "mpris.h"
 #include "niri.h"
+#include "visualizer.h"
 #include "wallpaper.h"
 #include "win98.h"
 
@@ -94,6 +95,7 @@ typedef enum {
     PANEL_SESSION,
     PANEL_DISPLAY,
     PANEL_WALLPAPER,
+    PANEL_VISUALIZER,
     PANEL_CONTROL_CENTER,
 } PanelKind;
 
@@ -206,6 +208,7 @@ struct NintyBar {
     MprisClient *mpris;
     GammaClient *gamma;
     WallpaperManager *wallpaper;
+    Visualizer *visualizer;
     GPtrArray *wallpaper_files;
     GHashTable *wallpaper_previews;
     int wallpaper_scroll;
@@ -3050,6 +3053,10 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
         frame.w = 360.0;
         frame.h = 420.0;
         break;
+    case PANEL_VISUALIZER:
+        frame.w = 320.0;
+        frame.h = 110.0;
+        break;
     default:
         frame.w = 1.0;
         frame.h = 1.0;
@@ -4412,6 +4419,42 @@ static void panel_draw_wallpaper(cairo_t *cr, NintyBar *bar,
     }
 }
 
+static void panel_draw_visualizer(cairo_t *cr, NintyBar *bar,
+                                   const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Visualizer");
+
+    double area_x = frame->x + 10.0;
+    double area_y = frame->y + frame->title_h + 8.0;
+    double area_w = frame->w - 20.0;
+    double area_h = frame->h - frame->title_h - 18.0;
+
+    guint count = visualizer_level_count(bar->visualizer);
+    if (count == 0) {
+        return;
+    }
+
+    double gap = 2.0;
+    double bar_w = MAX(1.0, (area_w - gap * (count - 1)) / count);
+    for (guint i = 0; i < count; i++) {
+        double level = visualizer_level(bar->visualizer, i);
+        double bar_h = MAX(1.0, level * (area_h - 2.0));
+        double x = area_x + i * (bar_w + gap);
+        double y = area_y + area_h - bar_h;
+        win98_fill(cr, x, y, bar_w, bar_h, win98_navy);
+    }
+}
+
+static void visualizer_changed_cb(Visualizer *visualizer,
+                                  gpointer user_data) {
+    (void)visualizer;
+    NintyBar *bar = user_data;
+    if (bar->panel_kind == PANEL_MEDIA ||
+        bar->panel_kind == PANEL_VISUALIZER ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+}
+
 static const char *session_menu_items[] = {
     "Lock", "Suspend", "Log Out", NULL, "Reboot", "Shut Down",
     "ADHD Mode"
@@ -4537,9 +4580,9 @@ static int control_center_layout(NintyBar *bar, double screen_w,
                                  PanelKind *kinds, int capacity) {
     static const PanelKind order[] = {
         PANEL_POWER,     PANEL_SESSION, PANEL_CALENDAR,
-        PANEL_VOLUME,    PANEL_NOTIFICATIONS, PANEL_MEDIA,
-        PANEL_CLIPBOARD, PANEL_NETWORK, PANEL_DISPLAY,
-        PANEL_WALLPAPER,
+        PANEL_VOLUME,    PANEL_NOTIFICATIONS, PANEL_VISUALIZER,
+        PANEL_MEDIA,     PANEL_CLIPBOARD, PANEL_NETWORK,
+        PANEL_DISPLAY,   PANEL_WALLPAPER,
     };
 
     int count = 0;
@@ -4630,6 +4673,9 @@ static void panel_draw_kind(cairo_t *cr, NintyBar *bar, PanelKind kind,
     case PANEL_WALLPAPER:
         panel_draw_wallpaper(cr, bar, frame);
         break;
+    case PANEL_VISUALIZER:
+        panel_draw_visualizer(cr, bar, frame);
+        break;
     default:
         break;
     }
@@ -4675,6 +4721,14 @@ static void panel_draw(GtkDrawingArea *area, cairo_t *cr, int width,
     } else {
         PanelFrame frame =
             panel_frame_for(bar, bar->panel_kind, logical_w, logical_h);
+        if (bar->panel_kind == PANEL_MEDIA) {
+            PanelFrame viz =
+                panel_frame_for(bar, PANEL_VISUALIZER, logical_w, logical_h);
+            viz.x = frame.x;
+            viz.w = frame.w;
+            viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+            panel_draw_kind(cr, bar, PANEL_VISUALIZER, &viz);
+        }
         panel_draw_kind(cr, bar, bar->panel_kind, &frame);
     }
     cairo_restore(cr);
@@ -4707,6 +4761,12 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     }
 
     close_menu(bar);
+    if (kind == PANEL_MEDIA || kind == PANEL_VISUALIZER ||
+        kind == PANEL_CONTROL_CENTER) {
+        visualizer_start(bar->visualizer);
+    } else {
+        visualizer_stop(bar->visualizer);
+    }
     if (kind == PANEL_CLIPBOARD) {
         g_free(bar->clipboard_query);
         bar->clipboard_query = g_strdup("");
@@ -4796,6 +4856,7 @@ static void close_panel(NintyBar *bar) {
         return;
     }
     bar->panel_kind = PANEL_NONE;
+    visualizer_stop(bar->visualizer);
     bar->volume_dragging = FALSE;
     bar->media_dragging = FALSE;
     bar->display_dragging = FALSE;
@@ -5191,6 +5252,17 @@ static void panel_clicked(GtkGestureClick *gesture, int n_press, double x,
     }
 
     PanelFrame frame = panel_frame_for(bar, bar->panel_kind, width, height);
+    if (bar->panel_kind == PANEL_MEDIA) {
+        PanelFrame viz = panel_frame_for(bar, PANEL_VISUALIZER, width,
+                                         height);
+        viz.x = frame.x;
+        viz.w = frame.w;
+        viz.y = MAX(8.0, frame.y - viz.h - 6.0);
+        if (x >= viz.x && x < viz.x + viz.w && y >= viz.y &&
+            y < viz.y + viz.h) {
+            return;
+        }
+    }
     if (x < frame.x || x >= frame.x + frame.w || y < frame.y ||
         y >= frame.y + frame.h) {
         close_panel(bar);
@@ -7476,6 +7548,10 @@ static PanelKind panel_kind_from_name(const char *name) {
     if (g_strcmp0(name, "wallpaper") == 0) {
         return PANEL_WALLPAPER;
     }
+    if (g_strcmp0(name, "visualizer") == 0 ||
+        g_strcmp0(name, "music-visualizer") == 0) {
+        return PANEL_VISUALIZER;
+    }
     return PANEL_NONE;
 }
 
@@ -8339,6 +8415,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
         g_build_filename(g_get_user_state_dir(), "nintysh", NULL);
     clipboard_load_state(bar);
     bar->wallpaper = wallpaper_manager_new(app);
+    bar->visualizer =
+        visualizer_new(visualizer_changed_cb, bar);
 
     load_css();
     load_apps(bar);
@@ -8435,6 +8513,9 @@ void ninty_bar_free(NintyBar *bar) {
     }
     if (bar->wallpaper != NULL) {
         wallpaper_manager_free(bar->wallpaper);
+    }
+    if (bar->visualizer != NULL) {
+        visualizer_free(bar->visualizer);
     }
     if (bar->media_art != NULL) {
         g_object_unref(bar->media_art);

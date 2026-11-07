@@ -15,6 +15,7 @@
   pam,
   wayland,
   gdk-pixbuf,
+  cava,
   extraConfig ? "",
   wrapperArgs ? [ ],
 }:
@@ -53,7 +54,7 @@ stdenv.mkDerivation {
 
   gappsWrapperArgs = [
     "--prefix" "PATH" ":"
-    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp networkmanager ])
+    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp networkmanager cava ])
   ] ++ wrapperArgs;
 
   buildPhase = ''

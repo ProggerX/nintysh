@@ -42,6 +42,7 @@
               pam
               wayland
               gdk-pixbuf
+              cava
             ];
           };
 

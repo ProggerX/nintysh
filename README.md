@@ -30,6 +30,7 @@ No support. No guarantees. It works on my machine.
 - `wl-clipboard` for text and image clipboard history
 - `wpctl` for audio output, microphone and default-device control
 - NetworkManager (`nmcli`) for the Wi-Fi network panel
+- `cava` for the music visualizer
 - PAM for the built-in lock screen
 - `brightnessctl`, `grim`, `slurp` and `loginctl` for the optional IPC actions
 - a system battery exposed through `/sys/class/power_supply` for the battery widget
@@ -68,6 +69,8 @@ The shell is a layer-shell client. Start it inside a running niri session.
   notifications by default (`notifications.deleteOnRead`)
 - MPRIS media panel with album art, progress/seek, play/pause, previous and
   next controls, player selection, plus tray and IPC control
+- Cava-backed music visualizer shown above the media panel and as its own card
+  in the control center
 - Per-monitor display panel with brightness and color-temperature sliders;
   internal panels use hardware backlight control, temperature and external
   outputs use wlr-gamma-control, and values are persisted per output
@@ -115,7 +118,7 @@ nintysh msg panel toggle notifications
 
 Panel names: `launcher`, `audio`, `media`, `display`, `clipboard`,
 `calendar`, `network`, `power`, `notifications`, `session`, `wallpaper`,
-`control-center`.
+`visualizer`, `control-center`.
 
 Audio output and microphone:
 
