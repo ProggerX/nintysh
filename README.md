@@ -1,6 +1,6 @@
 # nintysh
 
-This is a vibecoded Windows 98-style Wayland shell for niri.
+This is a vibecoded Windows 98-style Wayland shell for niri, Sway and Hyprland.
 
 It is not production software. You probably shouldn't touch this.
 
@@ -15,7 +15,7 @@ No support. No guarantees. It works on my machine.
 ### Requirements
 
 - Linux with Wayland
-- niri
+- niri, Sway or Hyprland
 - GTK4 + gtk4-layer-shell
 - `wl-clipboard` for text and image clipboard history
 - `wpctl` for audio output, microphone and default-device control
@@ -44,7 +44,12 @@ nix run .#
 nix develop
 ```
 
-The shell is a layer-shell client. Start it inside a running niri session.
+The shell is a layer-shell client. Start it inside a running niri, Sway or
+Hyprland session.
+
+The compositor backend is detected from `NIRI_SOCKET`,
+`HYPRLAND_INSTANCE_SIGNATURE` or `SWAYSOCK`. Set `NINTYSH_COMPOSITOR` to
+`niri`, `sway` or `hyprland` to override detection.
 
 ### Features
 
@@ -380,7 +385,10 @@ The module installs the package and, with `autostart`, creates a systemd user se
 
 ### Current limitations
 
-- niri only; the Sway backend was not kept
+- River 0.4.0 is not supported: the compositor/window-manager split removed the
+  status and control IPC a standalone shell would need
+- Hyprland fullscreen, layout and floating actions are best-effort approximations
+  of the niri equivalents
 - taskbars are created for every monitor, but menus, panels and OSD still open on the primary monitor
 - notification history is in-memory and limited by compile-time config; clipboard history is persisted
 - no StatusNotifier tray support

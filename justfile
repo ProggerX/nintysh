@@ -5,7 +5,7 @@ cc := env_var_or_default("CC", "cc")
 pkg_deps := "gtk4 gtk4-layer-shell-0 json-glib-1.0 gdk-pixbuf-2.0 wayland-client"
 pam_cflags := env_var_or_default("NINTYSH_PAM_CFLAGS", "")
 pam_libs := env_var_or_default("NINTYSH_PAM_LIBS", "-lpam")
-sources := "src/main.c src/win98.c src/niri.c src/mpris.c src/auth.c src/gamma.c src/gamma-protocol.c src/wallpaper.c src/visualizer.c src/bar.c src/control.c"
+sources := "src/main.c src/win98.c src/compositor.c src/niri.c src/sway.c src/hyprland.c src/mpris.c src/auth.c src/gamma.c src/gamma-protocol.c src/wallpaper.c src/visualizer.c src/bar.c src/control.c"
 
 default: build
 

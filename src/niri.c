@@ -1,5 +1,7 @@
 #include "niri.h"
 
+#include "compositor-backend.h"
+
 #include <gio/gio.h>
 #include <gio/gunixsocketaddress.h>
 #include <json-glib/json-glib.h>
@@ -674,3 +676,86 @@ void niri_client_fullscreen(NiriClient *client, gint64 id) {
     (void)client;
     niri_window_action("fullscreen-window", id);
 }
+
+static void niri_ops_changed(NiriClient *niri, gpointer user_data) {
+    (void)niri;
+    compositor_client_notify(user_data);
+}
+
+static gboolean niri_ops_init(CompositorClient *client) {
+    client->impl = niri_client_new(niri_ops_changed, client);
+    return client->impl != NULL;
+}
+
+static void niri_ops_destroy(CompositorClient *client) {
+    niri_client_free(client->impl);
+    client->impl = NULL;
+}
+
+static gboolean niri_ops_is_connected(CompositorClient *client) {
+    return niri_client_is_connected(client->impl);
+}
+
+static guint niri_ops_workspace_count(CompositorClient *client) {
+    return niri_client_workspace_count(client->impl);
+}
+
+static CompositorWorkspace *niri_ops_workspace(CompositorClient *client,
+                                               guint index) {
+    return niri_client_workspace(client->impl, index);
+}
+
+static guint niri_ops_window_count(CompositorClient *client) {
+    return niri_client_window_count(client->impl);
+}
+
+static CompositorWindow *niri_ops_window(CompositorClient *client,
+                                         guint index) {
+    return niri_client_window(client->impl, index);
+}
+
+static const char *niri_ops_keyboard_layout(CompositorClient *client) {
+    return niri_client_keyboard_layout(client->impl);
+}
+
+static void niri_ops_focus_workspace(CompositorClient *client, gint64 idx) {
+    niri_client_focus_workspace(client->impl, idx);
+}
+
+static void niri_ops_focus_window(CompositorClient *client, gint64 id) {
+    niri_client_focus_window(client->impl, id);
+}
+
+static void niri_ops_next_layout(CompositorClient *client) {
+    niri_client_next_layout(client->impl);
+}
+
+static void niri_ops_close_window(CompositorClient *client, gint64 id) {
+    niri_client_close_window(client->impl, id);
+}
+
+static void niri_ops_toggle_floating(CompositorClient *client, gint64 id) {
+    niri_client_toggle_floating(client->impl, id);
+}
+
+static void niri_ops_fullscreen(CompositorClient *client, gint64 id) {
+    niri_client_fullscreen(client->impl, id);
+}
+
+const CompositorOps niri_compositor_ops = {
+    .name = "niri",
+    .init = niri_ops_init,
+    .destroy = niri_ops_destroy,
+    .is_connected = niri_ops_is_connected,
+    .workspace_count = niri_ops_workspace_count,
+    .workspace = niri_ops_workspace,
+    .window_count = niri_ops_window_count,
+    .window = niri_ops_window,
+    .keyboard_layout = niri_ops_keyboard_layout,
+    .focus_workspace = niri_ops_focus_workspace,
+    .focus_window = niri_ops_focus_window,
+    .next_layout = niri_ops_next_layout,
+    .close_window = niri_ops_close_window,
+    .toggle_floating = niri_ops_toggle_floating,
+    .fullscreen = niri_ops_fullscreen,
+};
