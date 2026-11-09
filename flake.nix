@@ -1,5 +1,5 @@
 {
-  description = "nintysh - a Windows 98 flavoured Wayland shell for niri";
+  description = "nintysh - a Windows 98 flavoured Wayland shell for niri, Sway and Hyprland";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

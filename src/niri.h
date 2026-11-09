@@ -3,25 +3,10 @@
 
 #include <glib.h>
 
-typedef struct {
-    gint64 id;
-    gint64 idx;
-    char *name;
-    char *output;
-    gboolean is_active;
-    gboolean is_focused;
-    gboolean is_urgent;
-    gint64 active_window_id;
-} NiriWorkspace;
+#include "compositor.h"
 
-typedef struct {
-    gint64 id;
-    char *title;
-    char *app_id;
-    gint64 workspace_id;
-    gboolean is_focused;
-    gboolean is_urgent;
-} NiriWindow;
+typedef CompositorWorkspace NiriWorkspace;
+typedef CompositorWindow NiriWindow;
 
 typedef struct NiriClient NiriClient;
 typedef void (*NiriChangedFunc)(NiriClient *client, gpointer user_data);

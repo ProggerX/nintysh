@@ -5,7 +5,7 @@
 #include "control.h"
 #include "gamma.h"
 #include "mpris.h"
-#include "niri.h"
+#include "compositor.h"
 #include "visualizer.h"
 #include "wallpaper.h"
 #include "win98.h"
@@ -215,7 +215,7 @@ struct NintyBar {
     GtkWidget *popup_area;
     GPtrArray *popup_hits;
 
-    NiriClient *niri;
+    CompositorClient *compositor;
     MprisClient *mpris;
     GammaClient *gamma;
     WallpaperManager *wallpaper;
@@ -412,17 +412,19 @@ static void bar_queue_redraw(NintyBar *bar) {
     }
 }
 
-static const char *current_output(NiriClient *niri) {
-    guint count = niri_client_workspace_count(niri);
+static const char *current_output(CompositorClient *compositor) {
+    guint count = compositor_client_workspace_count(compositor);
 
     for (guint i = 0; i < count; i++) {
-        NiriWorkspace *workspace = niri_client_workspace(niri, i);
+        CompositorWorkspace *workspace =
+            compositor_client_workspace(compositor, i);
         if (workspace->is_focused && workspace->output != NULL) {
             return workspace->output;
         }
     }
     for (guint i = 0; i < count; i++) {
-        NiriWorkspace *workspace = niri_client_workspace(niri, i);
+        CompositorWorkspace *workspace =
+            compositor_client_workspace(compositor, i);
         if (workspace->is_active && workspace->output != NULL) {
             return workspace->output;
         }
@@ -430,7 +432,7 @@ static const char *current_output(NiriClient *niri) {
     return NULL;
 }
 
-static gboolean workspace_on_output(NiriWorkspace *workspace,
+static gboolean workspace_on_output(CompositorWorkspace *workspace,
                                     const char *output) {
     if (output == NULL || workspace->output == NULL) {
         return TRUE;
@@ -438,14 +440,16 @@ static gboolean workspace_on_output(NiriWorkspace *workspace,
     return g_strcmp0(workspace->output, output) == 0;
 }
 
-static gboolean window_on_output(NiriClient *niri, NiriWindow *window,
+static gboolean window_on_output(CompositorClient *compositor,
+                                 CompositorWindow *window,
                                  const char *output) {
     if (output == NULL || window->workspace_id < 0) {
         return TRUE;
     }
-    guint count = niri_client_workspace_count(niri);
+    guint count = compositor_client_workspace_count(compositor);
     for (guint i = 0; i < count; i++) {
-        NiriWorkspace *workspace = niri_client_workspace(niri, i);
+        CompositorWorkspace *workspace =
+            compositor_client_workspace(compositor, i);
         if (workspace->id == window->workspace_id) {
             return workspace->output == NULL ||
                    g_strcmp0(workspace->output, output) == 0;
@@ -584,7 +588,7 @@ static GtkIconPaintable *app_icon(NintyBar *bar, GAppInfo *app) {
     return paintable;
 }
 
-static GtkIconPaintable *window_icon(NintyBar *bar, NiriWindow *window) {
+static GtkIconPaintable *window_icon(NintyBar *bar, CompositorWindow *window) {
     if (window->app_id == NULL || window->app_id[0] == '\0') {
         return NULL;
     }
@@ -631,7 +635,7 @@ static void draw_paintable(cairo_t *cr, GtkIconPaintable *paintable,
     draw_gdk_paintable(cr, GDK_PAINTABLE(paintable), x, y, size);
 }
 
-static char *window_label(NiriWindow *window) {
+static char *window_label(CompositorWindow *window) {
     if (window->title != NULL && window->title[0] != '\0') {
         return g_strdup(window->title);
     }
@@ -2609,7 +2613,8 @@ static GAppInfo *menu_result_at(NintyBar *bar, int index) {
 
 static void close_menu(NintyBar *bar);
 
-static void niri_changed_cb(NiriClient *client, gpointer user_data) {
+static void compositor_changed_cb(CompositorClient *client,
+                                  gpointer user_data) {
     (void)client;
     NintyBar *bar = user_data;
     bar_queue_redraw(bar);
@@ -4922,13 +4927,17 @@ static void panel_handle_click(NintyBar *bar, PanelKind kind,
     if (kind == PANEL_TASKMENU) {
         int row = task_menu_row_at(frame, y);
         if (row == 0) {
-            niri_client_focus_window(bar->niri, bar->context_window_id);
+            compositor_client_focus_window(bar->compositor,
+                                           bar->context_window_id);
         } else if (row == 1) {
-            niri_client_toggle_floating(bar->niri, bar->context_window_id);
+            compositor_client_toggle_floating(bar->compositor,
+                                              bar->context_window_id);
         } else if (row == 2) {
-            niri_client_fullscreen(bar->niri, bar->context_window_id);
+            compositor_client_fullscreen(bar->compositor,
+                                         bar->context_window_id);
         } else if (row == 4) {
-            niri_client_close_window(bar->niri, bar->context_window_id);
+            compositor_client_close_window(bar->compositor,
+                                           bar->context_window_id);
         }
         if (row >= 0) {
             close_panel(bar);
@@ -6598,7 +6607,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
 
     const char *output = bar->active_output != NULL
                              ? bar->active_output
-                             : current_output(bar->niri);
+                             : current_output(bar->compositor);
     double x = 2.0;
     double y = BUTTON_Y;
     double button_h = BUTTON_HEIGHT;
@@ -6623,10 +6632,11 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     draw_separator(cr, x, y + 1.0, button_h - 2.0);
     x += 4.0;
 
-    guint workspace_count = niri_client_workspace_count(bar->niri);
+    guint workspace_count = compositor_client_workspace_count(bar->compositor);
     guint drawn_workspaces = 0;
     for (guint i = 0; i < workspace_count; i++) {
-        NiriWorkspace *workspace = niri_client_workspace(bar->niri, i);
+        CompositorWorkspace *workspace =
+            compositor_client_workspace(bar->compositor, i);
         if (!workspace_on_output(workspace, output)) {
             continue;
         }
@@ -6669,7 +6679,8 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     char clock_text[32];
     format_clock(clock_text, sizeof(clock_text));
     int clock_w = win98_text_width("00:00 PM", FALSE) + 10;
-    const char *layout_name = niri_client_keyboard_layout(bar->niri);
+    const char *layout_name =
+        compositor_client_keyboard_layout(bar->compositor);
     int layout_w = (layout_name != NULL && layout_name[0] != '\0')
                        ? MAX(20, win98_text_width(layout_name, TRUE) + 8)
                        : 0;
@@ -6682,11 +6693,11 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     }
 
     if (NINTYSH_TASKBAR_APPS) {
-    guint window_count = niri_client_window_count(bar->niri);
+    guint window_count = compositor_client_window_count(bar->compositor);
     guint visible_windows = 0;
     for (guint i = 0; i < window_count; i++) {
-        NiriWindow *window = niri_client_window(bar->niri, i);
-        if (window_on_output(bar->niri, window, output)) {
+        CompositorWindow *window = compositor_client_window(bar->compositor, i);
+        if (window_on_output(bar->compositor, window, output)) {
             visible_windows++;
         }
     }
@@ -6694,20 +6705,25 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     double task_x = x;
     double task_end = tray_x - 4.0;
     if (visible_windows == 0) {
-        if (!niri_client_is_connected(bar->niri)) {
-            win98_draw_text(cr, task_x + 4.0, y, MAX(0.0, task_end - task_x - 4.0),
-                       button_h, "Niri IPC offline", WIN98_ALIGN_LEFT, FALSE,
-                       win98_text_disabled, TRUE);
+        if (!compositor_client_is_connected(bar->compositor)) {
+            char *offline = g_strdup_printf(
+                "%s IPC offline", compositor_client_name(bar->compositor));
+            win98_draw_text(cr, task_x + 4.0, y,
+                       MAX(0.0, task_end - task_x - 4.0), button_h, offline,
+                       WIN98_ALIGN_LEFT, FALSE, win98_text_disabled, TRUE);
+            g_free(offline);
         }
     } else {
-        NiriWindow **windows = g_new0(NiriWindow *, visible_windows);
+        CompositorWindow **windows =
+            g_new0(CompositorWindow *, visible_windows);
         double *widths = g_new0(double, visible_windows);
         guint index = 0;
         double desired_total = 0.0;
 
         for (guint i = 0; i < window_count; i++) {
-            NiriWindow *window = niri_client_window(bar->niri, i);
-            if (!window_on_output(bar->niri, window, output)) {
+            CompositorWindow *window =
+                compositor_client_window(bar->compositor, i);
+            if (!window_on_output(bar->compositor, window, output)) {
                 continue;
             }
             windows[index] = window;
@@ -6735,7 +6751,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
                 break;
             }
 
-            NiriWindow *window = windows[i];
+            CompositorWindow *window = windows[i];
             gboolean pressed = window->is_focused;
             offset = pressed ? 1.0 : 0.0;
             win98_fill(cr, current_x, y, widths[i], button_h, win98_face);
@@ -6856,10 +6872,10 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
         }
         break;
     case HIT_WORKSPACE:
-        niri_client_focus_workspace(bar->niri, hit->value);
+        compositor_client_focus_workspace(bar->compositor, hit->value);
         break;
     case HIT_WINDOW:
-        niri_client_focus_window(bar->niri, hit->value);
+        compositor_client_focus_window(bar->compositor, hit->value);
         break;
     case HIT_VOLUME:
         open_panel(bar, PANEL_VOLUME);
@@ -6868,7 +6884,7 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
         open_panel(bar, PANEL_CALENDAR);
         break;
     case HIT_LAYOUT:
-        niri_client_next_layout(bar->niri);
+        compositor_client_next_layout(bar->compositor);
         break;
     case HIT_NETWORK:
         open_panel(bar, PANEL_NETWORK);
@@ -8232,11 +8248,11 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
             target = parts[2];
         }
         if (target != NULL) {
-            niri_client_focus_workspace(
-                bar->niri, g_ascii_strtoll(target, NULL, 10));
+            compositor_client_focus_workspace(
+                bar->compositor, g_ascii_strtoll(target, NULL, 10));
         }
     } else if (g_strcmp0(verb, "layout") == 0) {
-        niri_client_next_layout(bar->niri);
+        compositor_client_next_layout(bar->compositor);
     } else if (g_strcmp0(verb, "osd") == 0) {
         if (g_strcmp0(arg, "show") == 0) {
             char *text = join_command_args(parts, 2, count);
@@ -8519,7 +8535,7 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     bar->calendar_month = g_date_time_get_month(now);
     g_date_time_unref(now);
 
-    bar->niri = niri_client_new(niri_changed_cb, bar);
+    bar->compositor = compositor_client_new(compositor_changed_cb, bar);
     bar->mpris = mpris_client_new(NULL, bar);
     mpris_client_poll(bar->mpris);
     bar->gamma = gamma_client_new();
@@ -8574,8 +8590,8 @@ void ninty_bar_free(NintyBar *bar) {
     if (bar->control != NULL) {
         ninty_control_free(bar->control);
     }
-    if (bar->niri != NULL) {
-        niri_client_free(bar->niri);
+    if (bar->compositor != NULL) {
+        compositor_client_free(bar->compositor);
     }
     if (bar->mpris != NULL) {
         mpris_client_free(bar->mpris);

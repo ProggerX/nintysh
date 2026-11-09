@@ -70,7 +70,7 @@ stdenv.mkDerivation {
   '';
 
   meta = {
-    description = "A Windows 98 style Wayland shell for niri";
+    description = "A Windows 98 style Wayland shell for niri, Sway and Hyprland";
     platforms = lib.platforms.linux;
     mainProgram = "nintysh";
   };
