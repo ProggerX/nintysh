@@ -706,7 +706,7 @@ static void hyprland_ops_focus_window(CompositorClient *base, gint64 id) {
 
 static void hyprland_ops_next_layout(CompositorClient *base) {
     (void)base;
-    hyprland_send("dispatch layoutmsg togglesplit");
+    hyprland_send("switchxkblayout all next");
 }
 
 static void hyprland_ops_close_window(CompositorClient *base, gint64 id) {

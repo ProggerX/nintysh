@@ -387,8 +387,8 @@ The module installs the package and, with `autostart`, creates a systemd user se
 
 - River 0.4.0 is not supported: the compositor/window-manager split removed the
   status and control IPC a standalone shell would need
-- Hyprland fullscreen, layout and floating actions are best-effort approximations
-  of the niri equivalents
+- Hyprland fullscreen and floating actions are best-effort approximations of
+  the niri equivalents
 - taskbars are created for every monitor, but menus, panels and OSD still open on the primary monitor
 - notification history is in-memory and limited by compile-time config; clipboard history is persisted
 - no StatusNotifier tray support

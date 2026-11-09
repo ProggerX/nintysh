@@ -611,7 +611,8 @@ static gboolean sway_connect(SwayClient *client) {
     }
     g_object_unref(address);
 
-    const char *subscribe = "[\"workspace\",\"window\"]";
+    const char *subscribe =
+        "[\"workspace\",\"window\",\"input\"]";
     if (!sway_send_message(socket, SWAY_IPC_SUBSCRIBE, subscribe)) {
         g_object_unref(socket);
         return FALSE;
@@ -790,7 +791,7 @@ static void sway_ops_focus_window(CompositorClient *base, gint64 id) {
 
 static void sway_ops_next_layout(CompositorClient *base) {
     (void)base;
-    sway_run_command("layout toggle split");
+    sway_run_command("input type:keyboard xkb_switch_layout next");
 }
 
 static void sway_ops_close_window(CompositorClient *base, gint64 id) {
