@@ -550,8 +550,6 @@ static gboolean hyprland_connect(HyprlandClient *client) {
         return FALSE;
     }
 
-    g_socket_set_timeout(socket, 2);
-
     GSocketAddress *address = g_unix_socket_address_new(path);
     g_free(path);
     if (!g_socket_connect(socket, address, NULL, &error)) {

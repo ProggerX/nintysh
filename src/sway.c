@@ -610,7 +610,6 @@ static gboolean sway_connect(SwayClient *client) {
         return FALSE;
     }
     g_object_unref(address);
-    g_socket_set_timeout(socket, 2);
 
     const char *subscribe = "[\"workspace\",\"window\"]";
     if (!sway_send_message(socket, SWAY_IPC_SUBSCRIBE, subscribe)) {
