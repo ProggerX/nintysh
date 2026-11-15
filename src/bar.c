@@ -61,6 +61,7 @@ typedef enum {
     HIT_CLOCK,
     HIT_LAYOUT,
     HIT_NETWORK,
+    HIT_BLUETOOTH,
     HIT_BATTERY,
     HIT_CLIPBOARD,
     HIT_NOTIFICATIONS,
@@ -98,6 +99,7 @@ typedef enum {
     PANEL_VOLUME,
     PANEL_CALENDAR,
     PANEL_NETWORK,
+    PANEL_BLUETOOTH,
     PANEL_POWER,
     PANEL_TASKMENU,
     PANEL_CLIPBOARD,
@@ -158,6 +160,13 @@ typedef struct {
     gboolean active;
     gboolean saved;
 } WifiNetwork;
+
+typedef struct {
+    char *address;
+    char *name;
+    gboolean paired;
+    gboolean connected;
+} BluetoothDevice;
 
 typedef enum {
     OSD_KIND_NONE,
@@ -288,6 +297,16 @@ struct NintyBar {
     char *network_password_ssid;
     char *network_password;
 
+    GPtrArray *bluetooth_devices;
+    gboolean bluetooth_available;
+    gboolean bluetooth_powered;
+    gboolean bluetooth_discovering;
+    gboolean bluetooth_scanning;
+    gboolean bluetooth_refreshing;
+    gboolean bluetooth_refresh_pending;
+    char *bluetooth_adapter_name;
+    int bluetooth_scroll;
+
     gboolean menu_open;
     char *menu_query;
     int menu_scroll;
@@ -338,6 +357,7 @@ static void notification_popup_destroy(NintyBar *bar);
 static void notification_emit_closed(NintyBar *bar, guint id,
                                      guint reason);
 static void update_wifi(NintyBar *bar);
+static void update_bluetooth(NintyBar *bar);
 static void ninty_lock_screen(NintyBar *bar);
 static void ninty_unlock_screen(NintyBar *bar);
 static void screensaver_start(NintyBar *bar);
@@ -1416,6 +1436,251 @@ static void update_wifi(NintyBar *bar) {
     g_object_unref(process);
 }
 
+static void bluetooth_device_free(BluetoothDevice *device) {
+    if (device == NULL) {
+        return;
+    }
+    g_free(device->address);
+    g_free(device->name);
+    g_free(device);
+}
+
+static gint bluetooth_device_compare(gconstpointer a, gconstpointer b) {
+    const BluetoothDevice *da = *(BluetoothDevice *const *)a;
+    const BluetoothDevice *db = *(BluetoothDevice *const *)b;
+    if (da->connected != db->connected) {
+        return da->connected ? -1 : 1;
+    }
+    if (da->paired != db->paired) {
+        return da->paired ? -1 : 1;
+    }
+    return g_ascii_strcasecmp(da->name != NULL ? da->name : "",
+                              db->name != NULL ? db->name : "");
+}
+
+static gboolean bluetooth_string_list_contains(GPtrArray *list,
+                                               const char *value) {
+    return g_ptr_array_find_with_equal_func(list, value,
+                                            (GEqualFunc)g_str_equal,
+                                            NULL);
+}
+
+static void bluetooth_collect_address(GPtrArray *addresses,
+                                      const char *line) {
+    if (!g_str_has_prefix(line, "Device ")) {
+        return;
+    }
+    const char *rest = line + 7;
+    const char *space = strchr(rest, ' ');
+    char *address = space != NULL ? g_strndup(rest, (gsize)(space - rest))
+                                  : g_strdup(rest);
+    g_strstrip(address);
+    if (address[0] != '\0') {
+        g_ptr_array_add(addresses, address);
+    } else {
+        g_free(address);
+    }
+}
+
+static void bluetooth_apply_sections(NintyBar *bar, const char *output) {
+    enum {
+        BT_SECTION_NONE,
+        BT_SECTION_SHOW,
+        BT_SECTION_PAIRED,
+        BT_SECTION_CONNECTED,
+        BT_SECTION_DEVICES,
+    } section = BT_SECTION_NONE;
+
+    gboolean available = FALSE;
+    gboolean powered = FALSE;
+    gboolean discovering = FALSE;
+    char *adapter_name = NULL;
+    GPtrArray *paired =
+        g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *connected =
+        g_ptr_array_new_with_free_func(g_free);
+    GPtrArray *devices = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)bluetooth_device_free);
+
+    gchar **lines = g_strsplit(output, "\n", -1);
+    for (int i = 0; lines[i] != NULL; i++) {
+        char *line = lines[i];
+        if (g_strcmp0(line, "__NINTY_BT_SHOW__") == 0) {
+            section = BT_SECTION_SHOW;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_BT_PAIRED__") == 0) {
+            section = BT_SECTION_PAIRED;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_BT_CONNECTED__") == 0) {
+            section = BT_SECTION_CONNECTED;
+            continue;
+        }
+        if (g_strcmp0(line, "__NINTY_BT_DEVICES__") == 0) {
+            section = BT_SECTION_DEVICES;
+            continue;
+        }
+        if (line[0] == '\0') {
+            continue;
+        }
+
+        if (section == BT_SECTION_SHOW) {
+            char *text = g_strstrip(line);
+            if (g_str_has_prefix(text, "Controller ")) {
+                available = TRUE;
+            } else if (g_str_has_prefix(text, "Powered:")) {
+                available = TRUE;
+                powered = g_str_has_prefix(
+                    g_strstrip(text + strlen("Powered:")), "yes");
+            } else if (g_str_has_prefix(text, "Discovering:")) {
+                discovering = g_str_has_prefix(
+                    g_strstrip(text + strlen("Discovering:")), "yes");
+            } else if (g_str_has_prefix(text, "Alias:")) {
+                g_free(adapter_name);
+                adapter_name = g_strdup(
+                    g_strstrip(text + strlen("Alias:")));
+            } else if (g_str_has_prefix(text, "Name:") &&
+                       adapter_name == NULL) {
+                adapter_name = g_strdup(
+                    g_strstrip(text + strlen("Name:")));
+            }
+        } else if (section == BT_SECTION_PAIRED) {
+            bluetooth_collect_address(paired, line);
+        } else if (section == BT_SECTION_CONNECTED) {
+            bluetooth_collect_address(connected, line);
+        } else if (section == BT_SECTION_DEVICES) {
+            if (!g_str_has_prefix(line, "Device ")) {
+                continue;
+            }
+            const char *rest = line + 7;
+            const char *space = strchr(rest, ' ');
+            BluetoothDevice *device = g_new0(BluetoothDevice, 1);
+            device->address =
+                space != NULL ? g_strndup(rest, (gsize)(space - rest))
+                              : g_strdup(rest);
+            g_strstrip(device->address);
+            device->name = space != NULL
+                               ? g_strdup(space + 1)
+                               : g_strdup(device->address);
+            g_strstrip(device->name);
+            if (device->name[0] == '\0') {
+                g_free(device->name);
+                device->name = g_strdup(device->address);
+            }
+            device->paired = bluetooth_string_list_contains(
+                paired, device->address);
+            device->connected = bluetooth_string_list_contains(
+                connected, device->address);
+            if (device->address[0] != '\0') {
+                g_ptr_array_add(devices, device);
+            } else {
+                bluetooth_device_free(device);
+            }
+        }
+    }
+    g_strfreev(lines);
+    g_ptr_array_unref(paired);
+    g_ptr_array_unref(connected);
+
+    g_ptr_array_sort(devices, bluetooth_device_compare);
+    g_ptr_array_set_size(bar->bluetooth_devices, 0);
+    for (guint i = 0; i < devices->len; i++) {
+        g_ptr_array_add(bar->bluetooth_devices,
+                        g_ptr_array_index(devices, i));
+    }
+    g_ptr_array_set_free_func(devices, NULL);
+    g_ptr_array_unref(devices);
+
+    bar->bluetooth_available = available;
+    bar->bluetooth_powered = powered;
+    bar->bluetooth_discovering = discovering;
+    g_free(bar->bluetooth_adapter_name);
+    bar->bluetooth_adapter_name =
+        adapter_name != NULL ? adapter_name : g_strdup("");
+
+    if (bar->panel_kind == PANEL_BLUETOOTH ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    bar_queue_redraw(bar);
+}
+
+typedef struct {
+    NintyBar *bar;
+} BluetoothRefresh;
+
+static void bluetooth_refresh_done(GObject *source, GAsyncResult *result,
+                                   gpointer user_data) {
+    BluetoothRefresh *refresh = user_data;
+    NintyBar *bar = refresh->bar;
+    g_free(refresh);
+
+    GBytes *output = NULL;
+    GBytes *errors = NULL;
+    GError *error = NULL;
+    g_subprocess_communicate_finish(G_SUBPROCESS(source), result, &output,
+                                    &errors, &error);
+    gboolean ok = g_subprocess_get_successful(G_SUBPROCESS(source));
+    g_clear_error(&error);
+    if (errors != NULL) {
+        g_bytes_unref(errors);
+    }
+    if (ok && output != NULL) {
+        gsize length = 0;
+        const char *data = g_bytes_get_data(output, &length);
+        char *text = g_strndup(data != NULL ? data : "", length);
+        bluetooth_apply_sections(bar, text);
+        g_free(text);
+    }
+    if (output != NULL) {
+        g_bytes_unref(output);
+    }
+
+    bar->bluetooth_refreshing = FALSE;
+    if (bar->bluetooth_refresh_pending) {
+        bar->bluetooth_refresh_pending = FALSE;
+        update_bluetooth(bar);
+    }
+}
+
+static void update_bluetooth(NintyBar *bar) {
+    if (bar->bluetooth_refreshing) {
+        bar->bluetooth_refresh_pending = TRUE;
+        return;
+    }
+
+    static const char script[] =
+        "printf '__NINTY_BT_SHOW__\\n'; "
+        "bluetoothctl show; "
+        "printf '__NINTY_BT_PAIRED__\\n'; "
+        "bluetoothctl devices Paired; "
+        "printf '__NINTY_BT_CONNECTED__\\n'; "
+        "bluetoothctl devices Connected; "
+        "printf '__NINTY_BT_DEVICES__\\n'; "
+        "bluetoothctl devices; "
+        "true";
+
+    const char *argv[] = { "/bin/sh", "-c", script, NULL };
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_newv(
+        argv,
+        G_SUBPROCESS_FLAGS_STDOUT_PIPE |
+            G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    if (process == NULL) {
+        g_clear_error(&error);
+        return;
+    }
+
+    bar->bluetooth_refreshing = TRUE;
+    BluetoothRefresh *refresh = g_new0(BluetoothRefresh, 1);
+    refresh->bar = bar;
+    g_subprocess_communicate_async(process, NULL, NULL,
+                                   bluetooth_refresh_done, refresh);
+    g_object_unref(process);
+}
+
 typedef struct {
     NintyBar *bar;
     char *success;
@@ -1565,6 +1830,186 @@ static void network_disconnect(NintyBar *bar) {
         return;
     }
     osd_show_text(bar, "No active connection");
+}
+
+typedef struct {
+    NintyBar *bar;
+    char *success;
+    char *failure;
+} BluetoothAction;
+
+static void bluetooth_action_free(BluetoothAction *action) {
+    g_free(action->success);
+    g_free(action->failure);
+    g_free(action);
+}
+
+static void bluetooth_action_done(GObject *source, GAsyncResult *result,
+                                  gpointer user_data) {
+    BluetoothAction *action = user_data;
+    GError *error = NULL;
+    gboolean ok = g_subprocess_wait_check_finish(G_SUBPROCESS(source),
+                                                 result, &error);
+    if (ok) {
+        osd_show_text(action->bar, action->success);
+    } else {
+        osd_show_text(action->bar, action->failure);
+        g_clear_error(&error);
+    }
+    action->bar->bluetooth_scanning = FALSE;
+    update_bluetooth(action->bar);
+    bar_queue_redraw(action->bar);
+    if (action->bar->panel_kind == PANEL_BLUETOOTH ||
+        action->bar->panel_kind == PANEL_CONTROL_CENTER) {
+        gtk_widget_queue_draw(action->bar->panel_area);
+    }
+    bluetooth_action_free(action);
+}
+
+static void bluetooth_run(NintyBar *bar, const char *const *argv,
+                          const char *success, const char *failure) {
+    GError *error = NULL;
+    GSubprocess *process = g_subprocess_newv(
+        argv, G_SUBPROCESS_FLAGS_STDOUT_SILENCE |
+                  G_SUBPROCESS_FLAGS_STDERR_SILENCE,
+        &error);
+    if (process == NULL) {
+        osd_show_text(bar, failure);
+        g_clear_error(&error);
+        return;
+    }
+
+    BluetoothAction *action = g_new0(BluetoothAction, 1);
+    action->bar = bar;
+    action->success = g_strdup(success);
+    action->failure = g_strdup(failure);
+    g_subprocess_wait_check_async(process, NULL, bluetooth_action_done,
+                                  action);
+    g_object_unref(process);
+}
+
+static void bluetooth_set_powered(NintyBar *bar, gboolean enabled) {
+    const char *argv[] = { "bluetoothctl", "power",
+                           enabled ? "on" : "off", NULL };
+    char success[64];
+    g_snprintf(success, sizeof(success), "Bluetooth %s",
+               enabled ? "enabled" : "disabled");
+    bluetooth_run(bar, argv, success, "Could not change Bluetooth state");
+}
+
+static void bluetooth_toggle_powered(NintyBar *bar) {
+    bluetooth_set_powered(bar, !bar->bluetooth_powered);
+}
+
+static void bluetooth_scan(NintyBar *bar) {
+    if (bar->bluetooth_scanning) {
+        return;
+    }
+    const char *argv[] = { "bluetoothctl", "--timeout", "8", "scan",
+                           "on", NULL };
+    bar->bluetooth_scanning = TRUE;
+    if (bar->panel_kind == PANEL_BLUETOOTH ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    bluetooth_run(bar, argv, "Bluetooth scan complete",
+                  "Could not scan for Bluetooth devices");
+}
+
+static void bluetooth_connect(NintyBar *bar, BluetoothDevice *device) {
+    if (device == NULL || device->address == NULL) {
+        return;
+    }
+    const char *argv[] = { "bluetoothctl", "--timeout", "20", "connect",
+                           device->address, NULL };
+    char *success =
+        g_strdup_printf("Connecting to %s", device->name);
+    char *failure =
+        g_strdup_printf("Could not connect to %s", device->name);
+    bluetooth_run(bar, argv, success, failure);
+    g_free(success);
+    g_free(failure);
+}
+
+static void bluetooth_pair_connect(NintyBar *bar,
+                                   BluetoothDevice *device) {
+    if (device == NULL || device->address == NULL) {
+        return;
+    }
+    char *quoted = g_shell_quote(device->address);
+    char *command = g_strdup_printf(
+        "bluetoothctl --timeout 20 pair %s && "
+        "bluetoothctl --timeout 20 connect %s",
+        quoted, quoted);
+    const char *argv[] = { "/bin/sh", "-c", command, NULL };
+    char *success =
+        g_strdup_printf("Pairing with %s", device->name);
+    char *failure =
+        g_strdup_printf("Could not pair with %s", device->name);
+    bluetooth_run(bar, argv, success, failure);
+    g_free(command);
+    g_free(quoted);
+    g_free(success);
+    g_free(failure);
+}
+
+static void bluetooth_disconnect(NintyBar *bar, BluetoothDevice *device) {
+    if (device == NULL || device->address == NULL) {
+        return;
+    }
+    const char *argv[] = { "bluetoothctl", "disconnect",
+                           device->address, NULL };
+    char *success =
+        g_strdup_printf("Disconnected %s", device->name);
+    char *failure =
+        g_strdup_printf("Could not disconnect %s", device->name);
+    bluetooth_run(bar, argv, success, failure);
+    g_free(success);
+    g_free(failure);
+}
+
+static void bluetooth_toggle_device(NintyBar *bar,
+                                    BluetoothDevice *device) {
+    if (device == NULL) {
+        return;
+    }
+    if (device->connected) {
+        bluetooth_disconnect(bar, device);
+    } else if (device->paired) {
+        bluetooth_connect(bar, device);
+    } else {
+        bluetooth_pair_connect(bar, device);
+    }
+}
+
+static BluetoothDevice *bluetooth_find_device(NintyBar *bar,
+                                              const char *query) {
+    if (query == NULL || query[0] == '\0') {
+        return NULL;
+    }
+    char *needle = g_utf8_casefold(query, -1);
+    BluetoothDevice *partial = NULL;
+    for (guint i = 0; i < bar->bluetooth_devices->len; i++) {
+        BluetoothDevice *device =
+            g_ptr_array_index(bar->bluetooth_devices, i);
+        if (g_ascii_strcasecmp(device->address, query) == 0) {
+            g_free(needle);
+            return device;
+        }
+        char *folded = g_utf8_casefold(device->name, -1);
+        gboolean exact = g_strcmp0(folded, needle) == 0;
+        gboolean contains = strstr(folded, needle) != NULL;
+        g_free(folded);
+        if (exact) {
+            g_free(needle);
+            return device;
+        }
+        if (contains && partial == NULL) {
+            partial = device;
+        }
+    }
+    g_free(needle);
+    return partial;
 }
 
 static void clipboard_entry_free(ClipboardEntry *entry) {
@@ -3051,6 +3496,10 @@ static PanelFrame panel_frame_for(NintyBar *bar, PanelKind kind,
         frame.w = 340.0;
         frame.h = 440.0;
         break;
+    case PANEL_BLUETOOTH:
+        frame.w = 340.0;
+        frame.h = 440.0;
+        break;
     case PANEL_POWER:
         frame.w = 252.0;
         frame.h = 122.0;
@@ -3717,6 +4166,205 @@ static void panel_draw_network(cairo_t *cr, NintyBar *bar,
         double thumb_h = MAX(16.0, track_h * rows / count);
         thumb_h = MIN(thumb_h, track_h);
         double fraction = (double)bar->network_scroll / max_scroll;
+        double thumb_y = track_y + (track_h - thumb_h) * fraction;
+        win98_fill(cr, bx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
+        win98_bevel(cr, bx + 1.0, thumb_y, 10.0, thumb_h,
+                    WIN98_BEVEL_RAISED);
+    }
+}
+
+#define BLUETOOTH_ROW_HEIGHT 28.0
+
+static void bluetooth_action_rects(const PanelFrame *frame,
+                                   double *scan_x, double *y,
+                                   double *scan_w, double *h) {
+    *y = frame->y + 76.0;
+    *h = 22.0;
+    *scan_w = 64.0;
+    *scan_x = frame->x + frame->w - 8.0 - *scan_w;
+}
+
+static double bluetooth_list_y(const PanelFrame *frame) {
+    return frame->y + 122.0;
+}
+
+static int bluetooth_rows(const PanelFrame *frame) {
+    double available =
+        frame->y + frame->h - 8.0 - bluetooth_list_y(frame);
+    return MAX(0, (int)(available / BLUETOOTH_ROW_HEIGHT));
+}
+
+static int bluetooth_row_at(const PanelFrame *frame, double y) {
+    double list_y = bluetooth_list_y(frame);
+    if (y < list_y) {
+        return -1;
+    }
+    int row = (int)((y - list_y) / BLUETOOTH_ROW_HEIGHT);
+    return row < bluetooth_rows(frame) ? row : -1;
+}
+
+static int bluetooth_connected_count(NintyBar *bar) {
+    int count = 0;
+    for (guint i = 0; i < bar->bluetooth_devices->len; i++) {
+        BluetoothDevice *device =
+            g_ptr_array_index(bar->bluetooth_devices, i);
+        if (device->connected) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static void panel_draw_bluetooth(cairo_t *cr, NintyBar *bar,
+                                 const PanelFrame *frame) {
+    draw_panel_frame(cr, frame, "Bluetooth");
+
+    cairo_save(cr);
+    cairo_translate(cr, frame->x + 14.0, frame->y + 28.0);
+    cairo_scale(cr, 2.0, 2.0);
+    win98_draw_bluetooth_icon(cr, 0, 0, bar->bluetooth_powered);
+    cairo_restore(cr);
+
+    const char *status = "No adapter";
+    if (bar->bluetooth_available) {
+        status = bar->bluetooth_powered ? "On" : "Off";
+    }
+    win98_draw_text(cr, frame->x + 54.0, frame->y + 26.0,
+                    frame->w - 68.0, 18.0, status, WIN98_ALIGN_LEFT,
+                    TRUE, win98_text, FALSE);
+
+    int connected_count = bluetooth_connected_count(bar);
+    char adapter_text[288];
+    if (bar->bluetooth_available) {
+        g_snprintf(adapter_text, sizeof(adapter_text), "Adapter: %s",
+                   bar->bluetooth_adapter_name != NULL &&
+                           bar->bluetooth_adapter_name[0] != '\0'
+                       ? bar->bluetooth_adapter_name
+                       : "unknown");
+    } else {
+        g_snprintf(adapter_text, sizeof(adapter_text),
+                   "No Bluetooth adapter");
+    }
+    win98_draw_text(cr, frame->x + 54.0, frame->y + 44.0,
+                    frame->w - 68.0, 17.0, adapter_text,
+                    WIN98_ALIGN_LEFT, FALSE, win98_text, TRUE);
+
+    double scan_x = 0;
+    double action_y = 0;
+    double scan_w = 0;
+    double action_h = 0;
+    bluetooth_action_rects(frame, &scan_x, &action_y, &scan_w,
+                           &action_h);
+
+    double check_x = frame->x + 16.0;
+    double check_y = action_y + 4.0;
+    win98_fill(cr, check_x, check_y, 13.0, 13.0, win98_white);
+    win98_bevel(cr, check_x, check_y, 13.0, 13.0, WIN98_BEVEL_SUNKEN);
+    if (bar->bluetooth_powered) {
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_set_line_width(cr, 2.0);
+        cairo_move_to(cr, check_x + 3.0, check_y + 4.0);
+        cairo_line_to(cr, check_x + 5.5, check_y + 7.0);
+        cairo_line_to(cr, check_x + 10.0, check_y + 2.0);
+        cairo_stroke(cr);
+    }
+    win98_draw_text(cr, check_x + 19.0, action_y,
+                    scan_x - check_x - 27.0, action_h, "Bluetooth",
+                    WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
+
+    const char *scan_label =
+        bar->bluetooth_scanning ? "Scanning" : "Scan";
+    gboolean scan_enabled = bar->bluetooth_available &&
+                            bar->bluetooth_powered &&
+                            !bar->bluetooth_scanning;
+    win98_fill(cr, scan_x, action_y, scan_w, action_h, win98_face);
+    win98_bevel(cr, scan_x, action_y, scan_w, action_h,
+                WIN98_BEVEL_RAISED);
+    win98_draw_text(cr, scan_x, action_y, scan_w, action_h, scan_label,
+                    WIN98_ALIGN_CENTER, FALSE,
+                    scan_enabled ? win98_text : win98_text_disabled,
+                    TRUE);
+
+    double list_x = frame->x + 8.0;
+    double list_y = bluetooth_list_y(frame);
+    double list_w = frame->w - 24.0;
+    char devices_label[64];
+    if (connected_count > 0) {
+        g_snprintf(devices_label, sizeof(devices_label),
+                   "Devices (%d connected)", connected_count);
+    } else {
+        g_snprintf(devices_label, sizeof(devices_label), "Devices");
+    }
+    win98_draw_text(cr, frame->x + 16.0, frame->y + 102.0,
+                    frame->w - 32.0, 16.0, devices_label,
+                    WIN98_ALIGN_LEFT, TRUE, win98_text, FALSE);
+
+    int rows = bluetooth_rows(frame);
+    int count = (int)bar->bluetooth_devices->len;
+    int max_scroll = MAX(0, count - rows);
+    bar->bluetooth_scroll = CLAMP(bar->bluetooth_scroll, 0, max_scroll);
+
+    if (!bar->bluetooth_available) {
+        win98_draw_text(cr, list_x, list_y, list_w, BLUETOOTH_ROW_HEIGHT,
+                        "No Bluetooth adapter", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+    } else if (!bar->bluetooth_powered) {
+        win98_draw_text(cr, list_x, list_y, list_w, BLUETOOTH_ROW_HEIGHT,
+                        "Bluetooth is turned off", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+    } else if ((bar->bluetooth_scanning || bar->bluetooth_discovering) &&
+               count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w, BLUETOOTH_ROW_HEIGHT,
+                        "Scanning for devices...", WIN98_ALIGN_CENTER,
+                        FALSE, win98_text_disabled, TRUE);
+    } else if (count == 0) {
+        win98_draw_text(cr, list_x, list_y, list_w, BLUETOOTH_ROW_HEIGHT,
+                        "No devices found", WIN98_ALIGN_CENTER, FALSE,
+                        win98_text_disabled, TRUE);
+    }
+
+    for (int row = 0; row < rows; row++) {
+        int position = bar->bluetooth_scroll + row;
+        if (position >= count) {
+            break;
+        }
+        BluetoothDevice *device =
+            g_ptr_array_index(bar->bluetooth_devices, (guint)position);
+        double y = list_y + row * BLUETOOTH_ROW_HEIGHT;
+        gboolean selected = position == bar->panel_hover;
+        if (selected) {
+            win98_fill(cr, list_x, y, list_w, BLUETOOTH_ROW_HEIGHT,
+                       win98_navy);
+        }
+        if (device->connected) {
+            win98_fill(cr, list_x + 4.0, y + 10.0, 7.0, 7.0,
+                       selected ? win98_white : win98_navy);
+        }
+
+        const char *state = device->connected
+                                ? "Connected"
+                                : device->paired ? "Paired" : "Nearby";
+        win98_draw_text(cr, list_x + 18.0, y, list_w - 92.0,
+                        BLUETOOTH_ROW_HEIGHT, device->name,
+                        WIN98_ALIGN_LEFT, device->connected,
+                        selected ? win98_white : win98_text, TRUE);
+        win98_draw_text(cr, list_x + list_w - 72.0, y, 68.0,
+                        BLUETOOTH_ROW_HEIGHT, state, WIN98_ALIGN_RIGHT,
+                        FALSE, selected ? win98_white : win98_text,
+                        FALSE);
+    }
+
+    if (max_scroll > 0) {
+        double bx = frame->x + frame->w - 14.0;
+        double by = list_y;
+        double bh = frame->y + frame->h - 8.0 - list_y;
+        win98_fill(cr, bx, by, 12.0, bh, win98_light);
+        win98_bevel(cr, bx, by, 12.0, bh, WIN98_BEVEL_SUNKEN);
+        double track_y = by + 12.0;
+        double track_h = bh - 24.0;
+        double thumb_h = MAX(16.0, track_h * rows / count);
+        thumb_h = MIN(thumb_h, track_h);
+        double fraction = (double)bar->bluetooth_scroll / max_scroll;
         double thumb_y = track_y + (track_h - thumb_h) * fraction;
         win98_fill(cr, bx + 1.0, thumb_y, 10.0, thumb_h, win98_face);
         win98_bevel(cr, bx + 1.0, thumb_y, 10.0, thumb_h,
@@ -4617,7 +5265,7 @@ static int control_center_layout(NintyBar *bar, double screen_w,
         PANEL_POWER,     PANEL_SESSION, PANEL_CALENDAR,
         PANEL_VOLUME,    PANEL_NOTIFICATIONS, PANEL_VISUALIZER,
         PANEL_MEDIA,     PANEL_CLIPBOARD, PANEL_NETWORK,
-        PANEL_DISPLAY,   PANEL_WALLPAPER,
+        PANEL_BLUETOOTH, PANEL_DISPLAY, PANEL_WALLPAPER,
     };
 
     int count = 0;
@@ -4630,6 +5278,9 @@ static int control_center_layout(NintyBar *bar, double screen_w,
 
     for (guint i = 0; i < G_N_ELEMENTS(order) && count < capacity; i++) {
         PanelKind kind = order[i];
+        if (kind == PANEL_POWER && !bar->battery_available) {
+            continue;
+        }
         PanelFrame frame =
             panel_frame_for(bar, kind, screen_w, screen_h);
 
@@ -4685,6 +5336,9 @@ static void panel_draw_kind(cairo_t *cr, NintyBar *bar, PanelKind kind,
         break;
     case PANEL_NETWORK:
         panel_draw_network(cr, bar, frame);
+        break;
+    case PANEL_BLUETOOTH:
+        panel_draw_bluetooth(cr, bar, frame);
         break;
     case PANEL_POWER:
         panel_draw_power(cr, bar, frame);
@@ -4801,6 +5455,9 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
     if (kind == PANEL_NONE || bar->locked) {
         return;
     }
+    if (kind == PANEL_POWER && !bar->battery_available) {
+        return;
+    }
 
     close_menu(bar);
     if (kind == PANEL_MEDIA || kind == PANEL_VISUALIZER ||
@@ -4844,6 +5501,11 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
         bar->network_scroll = 0;
         bar->panel_hover = -1;
     }
+    if (kind == PANEL_BLUETOOTH) {
+        update_bluetooth(bar);
+        bar->bluetooth_scroll = 0;
+        bar->panel_hover = -1;
+    }
     if (kind == PANEL_WALLPAPER) {
         wallpaper_reload_files(bar);
         bar->wallpaper_scroll = 0;
@@ -4857,6 +5519,7 @@ static void open_panel(NintyBar *bar, PanelKind kind) {
         update_media_art(bar);
         wallpaper_reload_files(bar);
         update_wifi(bar);
+        update_bluetooth(bar);
         bar->panel_hover = -1;
     }
     if (kind == PANEL_CALENDAR) {
@@ -5124,6 +5787,43 @@ static void panel_handle_click(NintyBar *bar, PanelKind kind,
                 } else {
                     network_connect(bar, network->ssid);
                 }
+            }
+        }
+        return;
+    }
+
+    if (kind == PANEL_BLUETOOTH) {
+        double scan_x = 0;
+        double action_y = 0;
+        double scan_w = 0;
+        double action_h = 0;
+        bluetooth_action_rects(frame, &scan_x, &action_y, &scan_w,
+                               &action_h);
+        (void)action_h;
+
+        double check_x = frame->x + 16.0;
+        if (rect_contains(x, y, check_x, action_y, 18.0, 22.0)) {
+            if (bar->bluetooth_available) {
+                bluetooth_toggle_powered(bar);
+            }
+            return;
+        }
+        if (rect_contains(x, y, scan_x, action_y, scan_w, 22.0)) {
+            if (bar->bluetooth_available && bar->bluetooth_powered) {
+                bluetooth_scan(bar);
+            }
+            return;
+        }
+
+        int row = bluetooth_row_at(frame, y);
+        double list_x = frame->x + 8.0;
+        double list_w = frame->w - 24.0;
+        if (row >= 0 && x >= list_x && x < list_x + list_w) {
+            int position = bar->bluetooth_scroll + row;
+            if (position < (int)bar->bluetooth_devices->len) {
+                BluetoothDevice *device = g_ptr_array_index(
+                    bar->bluetooth_devices, (guint)position);
+                bluetooth_toggle_device(bar, device);
             }
         }
         return;
@@ -5531,6 +6231,9 @@ static int panel_hover_at(NintyBar *bar, PanelKind kind,
     if (kind == PANEL_NETWORK) {
         return network_row_at(frame, y);
     }
+    if (kind == PANEL_BLUETOOTH) {
+        return bluetooth_row_at(frame, y);
+    }
     if (kind == PANEL_SESSION) {
         return session_menu_row_at(frame, y);
     }
@@ -5581,6 +6284,7 @@ static void panel_motion(GtkEventControllerMotion *controller, double x,
         bar->panel_kind == PANEL_CLIPBOARD ||
         bar->panel_kind == PANEL_NOTIFICATIONS ||
         bar->panel_kind == PANEL_NETWORK ||
+        bar->panel_kind == PANEL_BLUETOOTH ||
         bar->panel_kind == PANEL_SESSION ||
         bar->panel_kind == PANEL_MEDIA ||
         bar->panel_kind == PANEL_WALLPAPER) {
@@ -5618,6 +6322,13 @@ static void panel_scroll_action(NintyBar *bar, PanelKind kind,
         int step = dy > 0 ? 2 : -2;
         bar->network_scroll =
             CLAMP(bar->network_scroll + step, 0, max_scroll);
+        gtk_widget_queue_draw(bar->panel_area);
+    } else if (kind == PANEL_BLUETOOTH) {
+        int max_scroll = MAX(0, (int)bar->bluetooth_devices->len -
+                                   bluetooth_rows(frame));
+        int step = dy > 0 ? 2 : -2;
+        bar->bluetooth_scroll =
+            CLAMP(bar->bluetooth_scroll + step, 0, max_scroll);
         gtk_widget_queue_draw(bar->panel_area);
     } else if (kind == PANEL_WALLPAPER) {
         int max_scroll = MAX(0, (int)bar->wallpaper_files->len -
@@ -6686,6 +7397,7 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
                        : 0;
     double tray_w = 4.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 + 20.0 +
                     20.0 + 20.0 + (bar->battery_available ? 20.0 : 0.0) +
+                    (bar->bluetooth_available ? 20.0 : 0.0) +
                     layout_w + 4.0 + clock_w + 4.0;
     double tray_x = w - 2.0 - tray_w;
     if (tray_x < x + 40.0) {
@@ -6800,6 +7512,14 @@ static void bar_draw(GtkDrawingArea *area, cairo_t *cr, int width, int height,
     bar_add_hit(bar, HIT_NETWORK, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
     icon_x += 20.0;
 
+    if (bar->bluetooth_available) {
+        win98_draw_bluetooth_icon(cr, icon_x, icon_y,
+                                  bar->bluetooth_powered);
+        bar_add_hit(bar, HIT_BLUETOOTH, icon_x - 1.0, icon_y, 18.0,
+                    16.0, 0);
+        icon_x += 20.0;
+    }
+
     win98_draw_volume_icon(cr, icon_x, icon_y,
                            bar->volume_available && bar->volume_muted);
     bar_add_hit(bar, HIT_VOLUME, icon_x - 1.0, icon_y, 18.0, 16.0, 0);
@@ -6889,6 +7609,9 @@ static void bar_clicked(GtkGestureClick *gesture, int n_press, double x,
     case HIT_NETWORK:
         open_panel(bar, PANEL_NETWORK);
         break;
+    case HIT_BLUETOOTH:
+        open_panel(bar, PANEL_BLUETOOTH);
+        break;
     case HIT_BATTERY:
         open_panel(bar, PANEL_POWER);
         break;
@@ -6959,6 +7682,10 @@ static gboolean bar_slow_tick(gpointer user_data) {
     changed |= update_network(bar);
     if (bar->panel_kind == PANEL_NETWORK) {
         update_wifi(bar);
+    }
+    if (bar->panel_kind == PANEL_BLUETOOTH ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
+        update_bluetooth(bar);
     }
     if (changed) {
         bar_queue_redraw(bar);
@@ -7600,6 +8327,10 @@ static PanelKind panel_kind_from_name(const char *name) {
         g_strcmp0(name, "wifi") == 0) {
         return PANEL_NETWORK;
     }
+    if (g_strcmp0(name, "bluetooth") == 0 ||
+        g_strcmp0(name, "bt") == 0) {
+        return PANEL_BLUETOOTH;
+    }
     if (g_strcmp0(name, "power") == 0 ||
         g_strcmp0(name, "battery") == 0) {
         return PANEL_POWER;
@@ -7738,6 +8469,84 @@ static void command_network(NintyBar *bar, gchar **parts, int count) {
         return;
     }
     open_panel(bar, PANEL_NETWORK);
+}
+
+static BluetoothDevice *bluetooth_first_connected(NintyBar *bar) {
+    for (guint i = 0; i < bar->bluetooth_devices->len; i++) {
+        BluetoothDevice *device =
+            g_ptr_array_index(bar->bluetooth_devices, i);
+        if (device->connected) {
+            return device;
+        }
+    }
+    return NULL;
+}
+
+static void command_bluetooth(NintyBar *bar, gchar **parts, int count) {
+    const char *action = count > 1 ? parts[1] : NULL;
+    if (action == NULL || g_strcmp0(action, "open") == 0 ||
+        g_strcmp0(action, "list") == 0) {
+        open_panel(bar, PANEL_BLUETOOTH);
+        return;
+    }
+    if (g_strcmp0(action, "scan") == 0) {
+        bluetooth_scan(bar);
+        return;
+    }
+    if (g_strcmp0(action, "on") == 0 ||
+        g_strcmp0(action, "enable") == 0) {
+        bluetooth_set_powered(bar, TRUE);
+        return;
+    }
+    if (g_strcmp0(action, "off") == 0 ||
+        g_strcmp0(action, "disable") == 0) {
+        bluetooth_set_powered(bar, FALSE);
+        return;
+    }
+    if (g_strcmp0(action, "toggle") == 0) {
+        bluetooth_toggle_powered(bar);
+        return;
+    }
+    if (g_strcmp0(action, "refresh") == 0) {
+        update_bluetooth(bar);
+        return;
+    }
+    if (g_strcmp0(action, "status") == 0) {
+        const char *text = !bar->bluetooth_available
+                               ? "No Bluetooth adapter"
+                               : bar->bluetooth_powered ? "Bluetooth on"
+                                                        : "Bluetooth off";
+        osd_show_text(bar, text);
+        return;
+    }
+    if (g_strcmp0(action, "connect") == 0 && count > 2) {
+        char *target = join_command_args(parts, 2, count);
+        open_panel(bar, PANEL_BLUETOOTH);
+        BluetoothDevice *device = bluetooth_find_device(bar, target);
+        if (device != NULL) {
+            bluetooth_toggle_device(bar, device);
+        } else {
+            BluetoothDevice raw = { target, target, FALSE, FALSE };
+            bluetooth_connect(bar, &raw);
+        }
+        g_free(target);
+        return;
+    }
+    if (g_strcmp0(action, "disconnect") == 0) {
+        char *target =
+            count > 2 ? join_command_args(parts, 2, count) : NULL;
+        BluetoothDevice *device =
+            target != NULL ? bluetooth_find_device(bar, target)
+                           : bluetooth_first_connected(bar);
+        if (device != NULL) {
+            bluetooth_disconnect(bar, device);
+        } else {
+            osd_show_text(bar, "No connected Bluetooth device");
+        }
+        g_free(target);
+        return;
+    }
+    open_panel(bar, PANEL_BLUETOOTH);
 }
 
 static char *wallpaper_resolve_path(NintyBar *bar, const char *path) {
@@ -8286,6 +9095,9 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         open_panel(bar, PANEL_CALENDAR);
     } else if (g_strcmp0(verb, "network") == 0) {
         command_network(bar, parts, count);
+    } else if (g_strcmp0(verb, "bluetooth") == 0 ||
+               g_strcmp0(verb, "bt") == 0) {
+        command_bluetooth(bar, parts, count);
     } else if (g_strcmp0(verb, "wallpaper") == 0) {
         const char *action = count > 1 ? parts[1] : NULL;
         char *argument =
@@ -8356,6 +9168,18 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
         network_toggle_wifi(bar);
     } else if (g_strcmp0(verb, "wifi-status") == 0) {
         osd_show_text(bar, bar->wifi_enabled ? "Wi-Fi on" : "Wi-Fi off");
+    } else if (g_strcmp0(verb, "bluetooth-enable") == 0) {
+        bluetooth_set_powered(bar, TRUE);
+    } else if (g_strcmp0(verb, "bluetooth-disable") == 0) {
+        bluetooth_set_powered(bar, FALSE);
+    } else if (g_strcmp0(verb, "bluetooth-toggle") == 0) {
+        bluetooth_toggle_powered(bar);
+    } else if (g_strcmp0(verb, "bluetooth-status") == 0) {
+        const char *text = !bar->bluetooth_available
+                               ? "No Bluetooth adapter"
+                               : bar->bluetooth_powered ? "Bluetooth on"
+                                                        : "Bluetooth off";
+        osd_show_text(bar, text);
     } else if (g_strcmp0(verb, "notification-clear-active") == 0 ||
                g_strcmp0(verb, "notification-clear-history") == 0) {
         notifications_clear(bar);
@@ -8483,6 +9307,8 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
         g_str_hash, g_str_equal, g_free, g_object_unref);
     bar->wifi_networks = g_ptr_array_new_with_free_func(
         (GDestroyNotify)wifi_network_free);
+    bar->bluetooth_devices = g_ptr_array_new_with_free_func(
+        (GDestroyNotify)bluetooth_device_free);
     bar->popup_hits = g_ptr_array_new_with_free_func(
         (GDestroyNotify)notification_popup_hit_free);
     bar->surfaces = g_ptr_array_new_with_free_func(
@@ -8546,6 +9372,7 @@ NintyBar *ninty_bar_new(GtkApplication *app) {
     update_audio_devices(bar);
     update_battery(bar);
     update_network(bar);
+    update_bluetooth(bar);
     notifications_init(bar);
 
     GNetworkMonitor *monitor = g_network_monitor_get_default();
@@ -8630,11 +9457,13 @@ void ninty_bar_free(NintyBar *bar) {
     g_hash_table_destroy(bar->wallpaper_previews);
     g_free(bar->wallpaper_dir);
     g_ptr_array_unref(bar->wifi_networks);
+    g_ptr_array_unref(bar->bluetooth_devices);
     g_ptr_array_unref(bar->popup_hits);
     g_free(bar->network_active_connection);
     g_free(bar->network_active_device);
     g_free(bar->network_password_ssid);
     g_free(bar->network_password);
+    g_free(bar->bluetooth_adapter_name);
     g_free(bar->last_clipboard_hash);
     g_free(bar->menu_query);
     g_ptr_array_unref(bar->surfaces);

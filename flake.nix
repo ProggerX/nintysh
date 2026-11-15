@@ -39,6 +39,7 @@
               grim
               slurp
               networkmanager
+              bluez
               pam
               wayland
               gdk-pixbuf

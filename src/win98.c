@@ -292,6 +292,30 @@ void win98_draw_network_icon(cairo_t *cr, double x, double y,
     cairo_restore(cr);
 }
 
+void win98_draw_bluetooth_icon(cairo_t *cr, double x, double y,
+                               gboolean enabled) {
+    cairo_save(cr);
+    cairo_translate(cr, x, y);
+
+    Win98Color color = enabled ? win98_blue : win98_shadow;
+    cairo_set_source_rgb(cr, color.r, color.g, color.b);
+    cairo_set_line_width(cr, 1.5);
+    cairo_set_line_cap(cr, CAIRO_LINE_CAP_ROUND);
+    cairo_set_line_join(cr, CAIRO_LINE_JOIN_ROUND);
+
+    cairo_move_to(cr, 8.0, 2.0);
+    cairo_line_to(cr, 13.0, 6.0);
+    cairo_line_to(cr, 3.0, 10.0);
+    cairo_move_to(cr, 8.0, 14.0);
+    cairo_line_to(cr, 13.0, 10.0);
+    cairo_line_to(cr, 3.0, 6.0);
+    cairo_move_to(cr, 8.0, 2.0);
+    cairo_line_to(cr, 8.0, 14.0);
+    cairo_stroke(cr);
+
+    cairo_restore(cr);
+}
+
 void win98_draw_battery_icon(cairo_t *cr, double x, double y, int percent,
                              gboolean charging) {
     cairo_save(cr);

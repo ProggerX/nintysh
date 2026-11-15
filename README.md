@@ -20,14 +20,16 @@ No support. No guarantees. It works on my machine.
 - `wl-clipboard` for text and image clipboard history
 - `wpctl` for audio output, microphone and default-device control
 - NetworkManager (`nmcli`) for the Wi-Fi network panel
+- BlueZ (`bluetoothctl`) for the Bluetooth panel
 - `cava` for the music visualizer
 - PAM for the built-in lock screen
 - `brightnessctl`, `grim`, `slurp` and `loginctl` for the optional IPC actions
 - a system battery exposed through `/sys/class/power_supply` for the battery widget
 
-Nix users get the GTK/JSON/wl-clipboard/audio/screenshot dependencies from the
-flake. The shell also owns `org.freedesktop.Notifications` on the session bus,
-so stop any other notification daemon first.
+Nix users get the GTK/JSON/wl-clipboard/audio/bluetooth/screenshot
+dependencies from the flake. The shell also owns
+`org.freedesktop.Notifications` on the session bus, so stop any other
+notification daemon first.
 
 ### Build and run
 
@@ -73,7 +75,9 @@ The compositor backend is detected from `NIRI_SOCKET`,
 - NetworkManager network panel with Wi-Fi toggle, scanning, active connection
   info, signal/security list, saved/open connections and a password prompt for
   new secured networks
-- Battery information panel
+- Bluetooth panel with adapter power toggle, device scanning, paired/connected
+  device list and connect/disconnect actions
+- Battery information panel (hidden automatically when no battery is present)
 - Clipboard history panel with text and image entries, thumbnails, search,
   arrow-key navigation and click/Enter-to-copy; history persists across restarts
 - Built-in PAM lock screen covering every monitor
@@ -112,8 +116,8 @@ nintysh msg panel toggle notifications
 ```
 
 Panel names: `launcher`, `audio`, `media`, `display`, `clipboard`,
-`calendar`, `network`, `power`, `notifications`, `session`, `wallpaper`,
-`visualizer`, `control-center`.
+`calendar`, `network`, `bluetooth`, `power`, `notifications`, `session`,
+`wallpaper`, `visualizer`, `control-center`.
 
 Audio output and microphone:
 
@@ -157,6 +161,23 @@ nintysh msg network connect "OPPO A78"
 nintysh msg network disconnect
 nintysh msg network refresh
 ```
+
+Bluetooth:
+
+```bash
+nintysh msg bluetooth open
+nintysh msg bluetooth scan
+nintysh msg bluetooth on
+nintysh msg bluetooth off
+nintysh msg bluetooth toggle
+nintysh msg bluetooth connect "Nothing Headphone"
+nintysh msg bluetooth connect "2C:BE:EE:A8:81:07"
+nintysh msg bluetooth disconnect
+nintysh msg bluetooth refresh
+```
+
+Device selectors accept an exact MAC address, an exact name, or a name
+substring. Connecting an unpaired device pairs it first.
 
 Wallpaper:
 
@@ -256,7 +277,9 @@ nintysh msg screenshot-fullscreen
 
 Additional compatibility aliases include `settings-open`, `settings-close`,
 `session lock-and-suspend`, `volume-set`, `volume-osd`, `mic-volume-*`,
-`wifi-enable`, `wifi-disable`, `wifi-toggle`, `media play|pause|toggle|next|previous`,
+`wifi-enable`, `wifi-disable`, `wifi-toggle`, `bluetooth-enable`,
+`bluetooth-disable`, `bluetooth-toggle`, `bluetooth-status`,
+`media play|pause|toggle|next|previous`,
 `clipboard-clear`, `clipboard-wipe`, `clipboard-copy`, `notification-clear-active`,
 `notification-clear-history`, and `osd-show`.
 

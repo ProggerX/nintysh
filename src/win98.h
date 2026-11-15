@@ -47,6 +47,8 @@ void win98_draw_app_icon(cairo_t *cr, double x, double y);
 void win98_draw_volume_icon(cairo_t *cr, double x, double y, gboolean muted);
 void win98_draw_network_icon(cairo_t *cr, double x, double y,
                              gboolean connected);
+void win98_draw_bluetooth_icon(cairo_t *cr, double x, double y,
+                               gboolean enabled);
 void win98_draw_battery_icon(cairo_t *cr, double x, double y, int percent,
                              gboolean charging);
 void win98_draw_clipboard_icon(cairo_t *cr, double x, double y);

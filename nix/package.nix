@@ -12,6 +12,7 @@
   grim,
   slurp,
   networkmanager,
+  bluez,
   pam,
   wayland,
   gdk-pixbuf,
@@ -54,7 +55,7 @@ stdenv.mkDerivation {
 
   gappsWrapperArgs = [
     "--prefix" "PATH" ":"
-    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp networkmanager cava ])
+    (lib.makeBinPath [ wl-clipboard brightnessctl grim slurp networkmanager bluez cava ])
   ] ++ wrapperArgs;
 
   buildPhase = ''
