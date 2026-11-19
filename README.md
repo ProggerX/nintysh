@@ -338,7 +338,12 @@ packages.default
 packages.nintysh
 overlays.default
 lib.mkNintysh
+hydraJobs
 ```
+
+`hydraJobs` is a flat x86_64-linux jobset containing the default package
+plus the `nintysh-custom`, `nintysh-highdpi` and `nintysh-compact` build
+variants.
 
 Custom package:
 
