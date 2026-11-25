@@ -264,6 +264,7 @@ struct NintyBar {
     GPtrArray *audio_sinks;
     GPtrArray *audio_sources;
     GPtrArray *notifications;
+    gboolean do_not_disturb;
 
     guint tick_source;
     guint slow_source;
@@ -2555,6 +2556,32 @@ static void notification_schedule_expiry(NintyBar *bar,
         g_timeout_add(timeout, notification_expire_cb, notification);
 }
 
+static void notification_set_dnd(NintyBar *bar, gboolean enabled) {
+    if (bar->do_not_disturb == enabled) {
+        return;
+    }
+    bar->do_not_disturb = enabled;
+
+    if (enabled) {
+        for (guint i = 0; i < bar->notifications->len; i++) {
+            NintyNotification *notification =
+                g_ptr_array_index(bar->notifications, i);
+            if (notification->expire_source != 0) {
+                g_source_remove(notification->expire_source);
+                notification->expire_source = 0;
+            }
+            notification->active = FALSE;
+        }
+        notification_popup_destroy(bar);
+    }
+
+    if (bar->panel_kind == PANEL_NOTIFICATIONS ||
+        bar->panel_kind == PANEL_CONTROL_CENTER) {
+        gtk_widget_queue_draw(bar->panel_area);
+    }
+    bar_queue_redraw(bar);
+}
+
 static void notification_emit_action(NintyBar *bar, guint id,
                                      const char *action) {
     if (bar->notifications_connection == NULL) {
@@ -2620,11 +2647,13 @@ static guint notification_add(NintyBar *bar, const char *app_name,
     notification->actions = actions != NULL ? g_strdupv(actions) : NULL;
     notification->image = image;
     notification->timestamp = g_get_real_time();
-    notification->active = !bar->locked;
+    notification->active = !bar->locked && !bar->do_not_disturb;
     notification->read = FALSE;
     notification_trim(bar);
     if (!bar->locked) {
-        notification_schedule_expiry(bar, notification, expire_timeout);
+        if (!bar->do_not_disturb) {
+            notification_schedule_expiry(bar, notification, expire_timeout);
+        }
         notification_popup_update(bar);
     }
     bar_queue_redraw(bar);
@@ -4533,13 +4562,26 @@ static void panel_draw_clipboard(cairo_t *cr, NintyBar *bar,
     }
 }
 
+static double notification_list_y(const PanelFrame *frame) {
+    return frame->y + frame->title_h + 30.0;
+}
+
+static void notification_dnd_rect(const PanelFrame *frame, double *x,
+                                  double *y, double *w, double *h) {
+    *x = frame->x + 8.0;
+    *y = frame->y + frame->title_h + 2.0;
+    *w = frame->w - 16.0;
+    *h = 22.0;
+}
+
 static int notification_rows(const PanelFrame *frame) {
-    return (int)((frame->h - frame->title_h - 16.0) /
-                 NINTYSH_NOTIFICATION_ROW_HEIGHT);
+    double available = frame->y + frame->h - 8.0 -
+                       notification_list_y(frame);
+    return MAX(0, (int)(available / NINTYSH_NOTIFICATION_ROW_HEIGHT));
 }
 
 static int notification_row_at(const PanelFrame *frame, double y) {
-    double list_y = frame->y + frame->title_h + 8.0;
+    double list_y = notification_list_y(frame);
     if (y < list_y) {
         return -1;
     }
@@ -4551,8 +4593,29 @@ static void panel_draw_notifications(cairo_t *cr, NintyBar *bar,
                                      const PanelFrame *frame) {
     draw_panel_frame(cr, frame, "Notifications");
 
+    double dnd_x = 0;
+    double dnd_y = 0;
+    double dnd_w = 0;
+    double dnd_h = 0;
+    notification_dnd_rect(frame, &dnd_x, &dnd_y, &dnd_w, &dnd_h);
+    double check_x = dnd_x + 8.0;
+    double check_y = dnd_y + 4.5;
+    win98_fill(cr, check_x, check_y, 13.0, 13.0, win98_white);
+    win98_bevel(cr, check_x, check_y, 13.0, 13.0, WIN98_BEVEL_SUNKEN);
+    if (bar->do_not_disturb) {
+        cairo_set_source_rgb(cr, 0, 0, 0);
+        cairo_set_line_width(cr, 2.0);
+        cairo_move_to(cr, check_x + 3.0, check_y + 4.0);
+        cairo_line_to(cr, check_x + 5.5, check_y + 7.0);
+        cairo_line_to(cr, check_x + 10.0, check_y + 2.0);
+        cairo_stroke(cr);
+    }
+    win98_draw_text(cr, check_x + 19.0, dnd_y, dnd_w - 27.0, dnd_h,
+                    "Do Not Disturb", WIN98_ALIGN_LEFT, TRUE, win98_text,
+                    FALSE);
+
     double list_x = frame->x + 8.0;
-    double list_y = frame->y + frame->title_h + 8.0;
+    double list_y = notification_list_y(frame);
     double list_w = frame->w - 24.0;
     int rows = notification_rows(frame);
     int count = (int)bar->notifications->len;
@@ -4601,7 +4664,7 @@ static void panel_draw_notifications(cairo_t *cr, NintyBar *bar,
     if (max_scroll > 0) {
         double sx = frame->x + frame->w - 14.0;
         double sy = list_y;
-        double sh = frame->h - frame->title_h - 16.0;
+        double sh = frame->y + frame->h - 8.0 - list_y;
         win98_fill(cr, sx, sy, 12.0, sh, win98_light);
         win98_bevel(cr, sx, sy, 12.0, sh, WIN98_BEVEL_SUNKEN);
         double track_y = sy + 12.0;
@@ -5690,6 +5753,16 @@ static void panel_handle_click(NintyBar *bar, PanelKind kind,
     }
 
     if (kind == PANEL_NOTIFICATIONS) {
+        double dnd_x = 0;
+        double dnd_y = 0;
+        double dnd_w = 0;
+        double dnd_h = 0;
+        notification_dnd_rect(frame, &dnd_x, &dnd_y, &dnd_w, &dnd_h);
+        if (rect_contains(x, y, dnd_x, dnd_y, dnd_w, dnd_h)) {
+            notification_set_dnd(bar, !bar->do_not_disturb);
+            return;
+        }
+
         int row = notification_row_at(frame, y);
         double list_x = frame->x + 8.0;
         double list_w = frame->w - 24.0;
@@ -8251,7 +8324,8 @@ static gboolean notification_popup_update_cb(gpointer user_data) {
 }
 
 static void notification_popup_update(NintyBar *bar) {
-    if (bar->locked || bar->panel_kind == PANEL_NOTIFICATIONS ||
+    if (bar->locked || bar->do_not_disturb ||
+        bar->panel_kind == PANEL_NOTIFICATIONS ||
         bar->panel_kind == PANEL_CONTROL_CENTER) {
         notification_popup_destroy(bar);
         return;
@@ -8768,6 +8842,22 @@ static void command_notifications(NintyBar *bar, gchar **parts, int count) {
         toggle_named_panel(bar, "notifications");
         return;
     }
+    if (g_strcmp0(action, "dnd") == 0 ||
+        g_strcmp0(action, "do-not-disturb") == 0) {
+        const char *state = count > 2 ? parts[2] : NULL;
+        if (state == NULL || g_strcmp0(state, "toggle") == 0) {
+            notification_set_dnd(bar, !bar->do_not_disturb);
+        } else if (g_strcmp0(state, "on") == 0 ||
+                   g_strcmp0(state, "true") == 0 ||
+                   g_strcmp0(state, "enable") == 0) {
+            notification_set_dnd(bar, TRUE);
+        } else if (g_strcmp0(state, "off") == 0 ||
+                   g_strcmp0(state, "false") == 0 ||
+                   g_strcmp0(state, "disable") == 0) {
+            notification_set_dnd(bar, FALSE);
+        }
+        return;
+    }
     if (g_strcmp0(action, "clear") == 0) {
         notifications_clear(bar);
         return;
@@ -9119,6 +9209,10 @@ void ninty_bar_command(NintyBar *bar, const char *command) {
                g_strcmp0(verb, "notification-clear") == 0 ||
                g_strcmp0(verb, "clear-notifications") == 0) {
         notifications_clear(bar);
+    } else if (g_strcmp0(verb, "notification-dnd") == 0 ||
+               g_strcmp0(verb, "notifications-dnd") == 0 ||
+               g_strcmp0(verb, "dnd-toggle") == 0) {
+        notification_set_dnd(bar, !bar->do_not_disturb);
     } else if (g_strcmp0(verb, "power") == 0) {
         open_panel(bar, PANEL_POWER);
     } else if (g_strcmp0(verb, "control-center") == 0 ||

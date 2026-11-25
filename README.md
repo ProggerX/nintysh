@@ -62,8 +62,9 @@ The compositor backend is detected from `NIRI_SOCKET`,
   selection, and default sink/source switching
 - Notification daemon (`org.freedesktop.Notifications`) with separate stacked
   popup cards, optional images (app icon, `image-path`, `image-data`), action
-  buttons, notification history, and a tray icon; clicking history keeps
-  notifications by default (`notifications.deleteOnRead`)
+  buttons, notification history, a tray icon, and a Do Not Disturb checkbox
+  that keeps new notifications in history without showing popups; clicking
+  history keeps notifications by default (`notifications.deleteOnRead`)
 - MPRIS media panel with album art, progress/seek, play/pause, previous and
   next controls, player selection, plus tray and IPC control
 - Cava-backed music visualizer shown above the media panel and as its own card
@@ -150,7 +151,13 @@ nintysh msg notifications toggle
 nintysh msg notifications dismiss 12
 nintysh msg notifications dismiss all
 nintysh msg notifications clear
+nintysh msg notifications dnd
+nintysh msg notifications dnd on
+nintysh msg notifications dnd off
 ```
+
+`notifications dnd` toggles Do Not Disturb; `notification-dnd` and
+`dnd-toggle` are compatibility aliases.
 
 Network:
 
